@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/perfMonitor.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -28,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -664,8 +666,10 @@ void GuestGpu::ThreadRun(void* data) {
 	Profiler::t_gpu_thread = true;
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	PerfMonitor::Initialize(&gpu->m_renderer.GetGraphics());
 
 	for (;;) {
+		PerfMonitor::Tick();
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -676,7 +680,11 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				Timeline::Mark("gpu-idle");
+				const auto idle_begin = std::chrono::steady_clock::now();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				PerfMonitor::AddGpuThreadIdle(std::chrono::duration<double>(
+				                                  std::chrono::steady_clock::now() - idle_begin)
+				                                  .count());
 				Timeline::Mark("gpu-wake");
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -700,7 +708,11 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					Timeline::Mark("gpu-blocked");
+					const auto blocked_begin = std::chrono::steady_clock::now();
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					PerfMonitor::AddGpuThreadBlocked(std::chrono::duration<double>(
+					                                     std::chrono::steady_clock::now() - blocked_begin)
+					                                     .count());
 					Timeline::Mark("gpu-unblocked");
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {

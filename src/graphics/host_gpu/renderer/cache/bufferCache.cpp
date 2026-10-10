@@ -7,6 +7,7 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/perfMonitor.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <fmt/format.h>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -389,6 +391,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
 	const bool async           = g_async_readback && !from_gpu_thread;
+	// KYTY_PERF: how long the game's own threads stand still waiting for GPU-written memory.
+	struct ReadbackTimer {
+		bool                                  active;
+		std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+		~ReadbackTimer() {
+			if (active) {
+				PerfMonitor::AddGameReadbackWait(
+				    std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+			}
+		}
+	} readback_timer {!from_gpu_thread && PerfMonitor::Enabled()};
 	for (;;) {
 		uint64_t wait_tick = 0;
 		m_scheduler.Context().GetGpu().SendCommandSync(

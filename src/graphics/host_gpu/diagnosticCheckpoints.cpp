@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/shader/shader.h"
 
 #include <array>
 #include <atomic>
@@ -43,6 +44,13 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	LOGF("  [%s] seq=%" PRIu64 " op=%s submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	     stage, checkpoint.sequence, OpName(checkpoint.op), checkpoint.submit_id, checkpoint.arg0,
 	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
+	// A dispatch records its CS code address in arg4: name the shader by the hash
+	// --skip-shaders takes, so a shader that loses the device can be stepped past.
+	if (checkpoint.op == 0 && checkpoint.arg4 != 0) {
+		const auto hash = ShaderDeclaredHash(checkpoint.arg4);
+		std::printf("  [%s] dispatch shader hash=0x%016" PRIx64 "\n", stage, hash);
+		LOGF("  [%s] dispatch shader hash=0x%016" PRIx64 "\n", stage, hash);
+	}
 }
 
 } // namespace
