@@ -1,7 +1,10 @@
 #ifndef KYTY_GRAPHICS_HOST_GPU_PERF_MONITOR_H_
 #define KYTY_GRAPHICS_HOST_GPU_PERF_MONITOR_H_
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -50,12 +53,37 @@ struct TextureSnapshot {
 	uint64_t target_bytes  = 0; // bound as a render or depth target
 	uint64_t gpu_bytes     = 0; // written by the GPU (kept until written back)
 	uint64_t pressure_mark = 0; // the collector's pressure threshold (collectable bytes)
+	uint64_t real_bytes      = 0; // what the images' video memory actually takes (VMA sizes)
+	uint64_t duplicate_bytes = 0; // images over guest bytes another image already covers
 };
 struct BufferSnapshot {
 	uint64_t buffers      = 0;
 	uint64_t total_bytes  = 0;
 	uint64_t trigger_mark = 0;
+	uint64_t pagetable_bytes  = 0; // video memory the page table holds
+	bool     pagetable_sparse = false;
+	// The largest buffers (at least 256 MB), largest first: a whole-heap descriptor mirrors its
+	// heap as one buffer. A background scan reports how much of each holds non-zero guest data.
+	static constexpr size_t MaxLarge = 4;
+	std::array<std::pair<uint64_t, uint64_t>, MaxLarge> large {}; // guest address, size
+	size_t                                               large_count = 0;
 };
+
+// Texture cache events, in bytes, for the report's churn line: what was made and why images
+// went (the collector under memory pressure, a bindless texture no draw sampled, the guest
+// dropping it from its heaps, the guest unmapping its memory, or replaced by another image).
+enum class TextureEvent : uint32_t {
+	Created,
+	FreedCollector,
+	FreedBindless,
+	FreedGuestDrop,
+	FreedUnmap,
+	FreedReplaced,
+	Count,
+};
+void AddTextureEvent(TextureEvent event, uint64_t bytes);
+// A draw or dispatch ran a shader that stores through guest pointers (any thread).
+void AddAddressWriteShader();
 bool SnapshotDueTexture();
 bool SnapshotDueBuffer();
 void SetTextureSnapshot(const TextureSnapshot& snapshot);

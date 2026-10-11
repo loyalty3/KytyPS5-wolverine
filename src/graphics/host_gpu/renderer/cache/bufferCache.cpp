@@ -55,6 +55,20 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	}
 }
 
+// The table spans the guest's whole address range (BDA_PAGETABLE_SIZE, 768 MB) while a title
+// touches a few GB of it: sparse, it costs video memory only where buffers are registered.
+// KYTY_DENSE_PAGETABLE=1, or a device without strict sparse residency, keeps it dense.
+std::unique_ptr<Buffer> BufferCache::MakePageTable(GraphicContext& graphics,
+                                                   CommandScheduler& scheduler) {
+	if (graphics.sparse_buffer_enabled) {
+		// No device address: the table is bound as a storage buffer only.
+		return std::make_unique<Buffer>(graphics, scheduler, Buffer::SparseTag {},
+		                                AllFlags, BDA_PAGETABLE_SIZE);
+	}
+	return std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+	                                BDA_PAGETABLE_SIZE);
+}
+
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
 }
@@ -90,7 +104,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
+		m_bda_pagetable_buffer->MakeResident(table_offset,
+		                                     addresses.size() * sizeof(vk::DeviceAddress));
+		WriteDataBuffer(*m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
@@ -99,7 +115,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
+		m_bda_pagetable_buffer->Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
@@ -280,8 +296,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
+      m_bda_pagetable_buffer(MakePageTable(graphics, scheduler)),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -290,7 +305,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
-	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
+	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer->Handle(),
 	                     "BDA Page Table Buffer");
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
@@ -1383,9 +1398,24 @@ void BufferCache::RunGarbageCollector() {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	if (PerfMonitor::SnapshotDueBuffer()) {
-		PerfMonitor::SetBufferSnapshot({.buffers      = m_buffers.size(),
-		                                .total_bytes  = m_total_used_memory,
-		                                .trigger_mark = m_trigger_gc_memory});
+		PerfMonitor::BufferSnapshot snapshot {.buffers      = m_buffers.size(),
+		                                      .total_bytes  = m_total_used_memory,
+		                                      .trigger_mark = m_trigger_gc_memory,
+		                                      .pagetable_bytes  = m_bda_pagetable_buffer->ResidentBytes(),
+		                                      .pagetable_sparse = m_bda_pagetable_buffer->IsSparse()};
+		std::vector<std::pair<uint64_t, uint64_t>> large; // size, guest address
+		for (const auto& [address, id]: m_buffers) {
+			const auto* buffer = m_slot_buffers.try_get(id);
+			if (buffer != nullptr && !buffer->is_deleted && buffer->Size() >= 256 * MiB) {
+				large.emplace_back(buffer->Size(), address);
+			}
+		}
+		std::sort(large.begin(), large.end(), std::greater<>());
+		snapshot.large_count = std::min(large.size(), PerfMonitor::BufferSnapshot::MaxLarge);
+		for (size_t i = 0; i < snapshot.large_count; i++) {
+			snapshot.large[i] = {large[i].second, large[i].first};
+		}
+		PerfMonitor::SetBufferSnapshot(snapshot);
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

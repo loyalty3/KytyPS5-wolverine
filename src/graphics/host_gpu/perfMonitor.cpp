@@ -4,6 +4,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "kernel/memory.h"
 #include "kytyGitVersion.h"
 
 #if defined(__clang__)
@@ -23,6 +24,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 namespace Libs::Graphics::PerfMonitor {
 
@@ -49,6 +52,61 @@ TextureSnapshot    g_tex_snapshot {};
 BufferSnapshot     g_buf_snapshot {};
 bool               g_tex_valid = false;
 bool               g_buf_valid = false;
+
+std::array<std::atomic<uint64_t>, static_cast<size_t>(TextureEvent::Count)> g_tex_bytes {};
+std::array<std::atomic<uint64_t>, static_cast<size_t>(TextureEvent::Count)> g_tex_count {};
+std::atomic<uint64_t> g_address_writes {0};
+
+// Background scan of the large buffers' guest bytes: per buffer, how much of it (in 64 KB
+// blocks) holds anything but zeros. Video memory a sparse buffer could leave unbacked.
+constexpr double   kScanSeconds = 30.0;
+constexpr uint64_t kScanBlock   = 64 * 1024;
+struct ScanResult {
+	uint64_t address  = 0;
+	uint64_t size     = 0;
+	uint64_t nonzero  = 0;
+	bool     complete = false;
+};
+std::mutex                                           g_scan_mutex;
+std::array<ScanResult, BufferSnapshot::MaxLarge>      g_scan {};
+size_t                                               g_scan_count = 0;
+std::atomic<bool>                                    g_scan_running {false};
+Clock::time_point                                    g_scan_last {};
+
+void ScanLargeBuffers(std::array<std::pair<uint64_t, uint64_t>, BufferSnapshot::MaxLarge> large,
+                      size_t count) {
+	std::vector<uint8_t> chunk(16 * kScanBlock);
+	std::array<ScanResult, BufferSnapshot::MaxLarge> results {};
+	for (size_t i = 0; i < count; i++) {
+		const auto [address, size] = large[i];
+		uint64_t nonzero = 0;
+		bool     ok      = true;
+		for (uint64_t offset = 0; offset < size && ok; offset += chunk.size()) {
+			const auto bytes = std::min<uint64_t>(chunk.size(), size - offset);
+			if (!Libs::LibKernel::Memory::TryReadBacking(address + offset, chunk.data(), bytes)) {
+				// Unmapped in part: count the chunk as unknown (non-zero) and go on.
+				nonzero += bytes;
+				continue;
+			}
+			for (uint64_t block = 0; block < bytes; block += kScanBlock) {
+				const auto  length = std::min<uint64_t>(kScanBlock, bytes - block);
+				const auto* words  = reinterpret_cast<const uint64_t*>(chunk.data() + block);
+				bool        any    = false;
+				for (uint64_t w = 0; w < length / 8 && !any; w++) {
+					any = words[w] != 0;
+				}
+				nonzero += any ? length : 0;
+			}
+		}
+		results[i] = {address, size, nonzero, ok};
+	}
+	{
+		std::scoped_lock lock(g_scan_mutex);
+		g_scan       = results;
+		g_scan_count = count;
+	}
+	g_scan_running.store(false, std::memory_order_release);
+}
 
 // Owned by the GPU thread (Tick).
 Clock::time_point g_window_start {};
@@ -85,7 +143,7 @@ void Initialize(GraphicContext* graphics) {
 	// The draw, dispatch, wait and readback counters (Profiler::Add) count only while this is on.
 	Profiler::g_counters = true;
 	g_window_start       = Clock::now();
-	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 2), a report every %.0f s\n", KYTY_BUILD_LABEL,
+	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 4), a report every %.0f s\n", KYTY_BUILD_LABEL,
 	            kReportSeconds);
 	std::fflush(stdout);
 }
@@ -142,6 +200,21 @@ void SetBufferSnapshot(const BufferSnapshot& snapshot) {
 	std::scoped_lock lock(g_snapshot_mutex);
 	g_buf_snapshot = snapshot;
 	g_buf_valid    = true;
+}
+
+void AddTextureEvent(TextureEvent event, uint64_t bytes) {
+	if (!g_enabled) {
+		return;
+	}
+	const auto index = static_cast<size_t>(event);
+	g_tex_bytes[index].fetch_add(bytes, std::memory_order_relaxed);
+	g_tex_count[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+void AddAddressWriteShader() {
+	if (g_enabled) {
+		g_address_writes.fetch_add(1, std::memory_order_relaxed);
+	}
 }
 
 void Tick() {
@@ -202,6 +275,10 @@ void Tick() {
 	// process, and what sits in system-memory heaps (spilled buffers and images: every GPU access
 	// to them crosses PCIe).
 	uint64_t card_used = 0, card_budget = 0, system_used = 0;
+	// VMA's own view of the card: memory objects it holds (blocks and dedicated allocations)
+	// against the bytes allocated in them. The difference is room inside blocks that only a
+	// block's last allocation going would return.
+	uint64_t card_blocks = 0, card_allocated = 0, card_block_count = 0, card_allocation_count = 0;
 	if (g_graphics != nullptr && g_graphics->allocator != nullptr && g_graphics->CanReportMemoryUsage()) {
 		VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
 		vmaGetHeapBudgets(g_graphics->allocator, budgets);
@@ -212,6 +289,10 @@ void Tick() {
 			if (local) {
 				card_used += budgets[heap].usage;
 				card_budget += budgets[heap].budget;
+				card_blocks += budgets[heap].statistics.blockBytes;
+				card_allocated += budgets[heap].statistics.allocationBytes;
+				card_block_count += budgets[heap].statistics.blockCount;
+				card_allocation_count += budgets[heap].statistics.allocationCount;
 			} else {
 				system_used += budgets[heap].statistics.blockBytes;
 			}
@@ -247,12 +328,60 @@ void Tick() {
 			std::printf("textures %" PRIu64 " MB in %" PRIu64 " images (heap-pinned %" PRIu64
 			            " MB, targets %" PRIu64 " MB, GPU-written %" PRIu64
 			            " MB; collector mark %" PRIu64 " MB) | buffers %" PRIu64 " MB in %" PRIu64
-			            " (collector mark %" PRIu64 " MB)\n",
+			            " (collector mark %" PRIu64 " MB) | page table %" PRIu64 " MB %s\n",
 			            g_tex_snapshot.total_bytes >> 20u, g_tex_snapshot.images,
 			            g_tex_snapshot.pinned_bytes >> 20u, g_tex_snapshot.target_bytes >> 20u,
 			            g_tex_snapshot.gpu_bytes >> 20u, g_tex_snapshot.pressure_mark >> 20u,
 			            g_buf_snapshot.total_bytes >> 20u, g_buf_snapshot.buffers,
-			            g_buf_snapshot.trigger_mark >> 20u);
+			            g_buf_snapshot.trigger_mark >> 20u, g_buf_snapshot.pagetable_bytes >> 20u,
+			            g_buf_snapshot.pagetable_sparse ? "(sparse)" : "(dense)");
+			std::printf("Perf vram: VMA holds %" PRIu64 " MB in %" PRIu64 " memory objects, %" PRIu64
+			            " MB of it allocated (%" PRIu64 " allocations; %" PRIu64
+			            " MB free inside blocks) | images: %" PRIu64 " MB real, %" PRIu64
+			            " MB duplicating guest bytes of another image, %" PRIu64 " with memory of their own (%" PRIu64
+			            " MB)\n",
+			            card_blocks >> 20u, card_block_count, card_allocated >> 20u,
+			            card_allocation_count, (card_blocks - std::min(card_blocks, card_allocated)) >> 20u,
+			            g_tex_snapshot.real_bytes >> 20u, g_tex_snapshot.duplicate_bytes >> 20u,
+			            GraphicContext::DedicatedImageCount(), GraphicContext::DedicatedImageBytes() >> 20u);
+		}
+	}
+	{
+		std::array<uint64_t, static_cast<size_t>(TextureEvent::Count)> bytes {};
+		std::array<uint64_t, static_cast<size_t>(TextureEvent::Count)> count {};
+		for (size_t i = 0; i < bytes.size(); i++) {
+			bytes[i] = g_tex_bytes[i].exchange(0, std::memory_order_relaxed) >> 20u;
+			count[i] = g_tex_count[i].exchange(0, std::memory_order_relaxed);
+		}
+		const auto address_writes = g_address_writes.exchange(0, std::memory_order_relaxed);
+		std::printf("Perf churn: textures made %" PRIu64 " (%" PRIu64 " MB); freed by the collector %" PRIu64
+		            " (%" PRIu64 " MB), unsampled bindless %" PRIu64 " (%" PRIu64
+		            " MB), guest dropped %" PRIu64 " (%" PRIu64 " MB), guest unmapped %" PRIu64 " (%" PRIu64
+		            " MB), replaced %" PRIu64 " (%" PRIu64 " MB) | shaders storing through pointers: %" PRIu64
+		            " runs\n",
+		            count[0], bytes[0], count[1], bytes[1], count[2], bytes[2], count[3], bytes[3],
+		            count[4], bytes[4], count[5], bytes[5], address_writes);
+	}
+	{
+		std::scoped_lock lock(g_snapshot_mutex);
+		if (g_buf_valid && g_buf_snapshot.large_count != 0) {
+			std::scoped_lock scan_lock(g_scan_mutex);
+			std::printf("Perf large buffers:");
+			for (size_t i = 0; i < g_buf_snapshot.large_count; i++) {
+				const auto [address, size] = g_buf_snapshot.large[i];
+				std::printf(" %" PRIu64 " MB at 0x%010" PRIx64, size >> 20u, address);
+				for (size_t j = 0; j < g_scan_count; j++) {
+					if (g_scan[j].address == address && g_scan[j].size == size) {
+						std::printf(" (non-zero guest data %" PRIu64 " MB)", g_scan[j].nonzero >> 20u);
+					}
+				}
+				std::printf(i + 1 < g_buf_snapshot.large_count ? ";" : "\n");
+			}
+			const bool due = std::chrono::duration<double>(now - g_scan_last).count() >= kScanSeconds;
+			if (due && !g_scan_running.exchange(true, std::memory_order_acq_rel)) {
+				g_scan_last = now;
+				std::thread(ScanLargeBuffers, g_buf_snapshot.large, g_buf_snapshot.large_count).detach();
+			}
 		}
 	}
 	std::fflush(stdout);

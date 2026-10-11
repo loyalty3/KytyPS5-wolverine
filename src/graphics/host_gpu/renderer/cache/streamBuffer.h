@@ -39,8 +39,24 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// A sparse-residency buffer: address space only, no memory until MakeResident binds it.
+	// Unbound ranges read as zero and drop writes (residencyNonResidentStrict). Needs
+	// GraphicContext::sparse_buffer_enabled.
+	struct SparseTag {};
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseTag,
+	       vk::BufferUsageFlags flags, uint64_t size);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
+
+	[[nodiscard]] bool IsSparse() const noexcept { return m_sparse; }
+	// Sparse only (a dense buffer returns at once): binds memory under [offset, offset+size) and
+	// zero-fills what it binds before the scheduler's next submission.
+	// Binding waits for submitted work first (it may read these pages expecting zero) and
+	// zeroes in a command buffer of its own; the one being recorded is not split.
+	// GPU thread only. Memory stays bound until the buffer is destroyed.
+	void MakeResident(uint64_t offset, uint64_t size);
+	// Bytes bound so far (sparse), or the whole size (dense).
+	[[nodiscard]] uint64_t ResidentBytes() const noexcept;
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
@@ -95,6 +111,13 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
+	// Sparse: one allocation per bound chunk, null where nothing is bound.
+	bool                          m_sparse          = false;
+	uint64_t                      m_chunk_size      = 0;
+	uint32_t                      m_memory_type_bits = 0;
+	std::vector<VmaAllocation>    m_chunks;
+	uint64_t                      m_resident_bytes  = 0;
+	vk::CommandPool               m_pool            = nullptr;
 };
 
 class StreamBuffer final: public Buffer {

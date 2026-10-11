@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cstring>
@@ -139,10 +140,182 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+namespace {
+// Bound per chunk: 1 MB of table covers 2 GiB of guest addresses (16 KB pages, 8 bytes each), so
+// a title binds a few dozen chunks over a session and the GPU drains once per new chunk set.
+constexpr uint64_t SPARSE_CHUNK_MIN = 1ull << 20u;
+} // namespace
+
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseTag,
+               vk::BufferUsageFlags flags, uint64_t size)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_size(size), m_sparse(true) {
+	EXIT_IF(!graphics.sparse_buffer_enabled || size == 0);
+	EXIT_IF(static_cast<bool>(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress));
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.flags = vk::BufferCreateFlagBits::eSparseBinding |
+	                    vk::BufferCreateFlagBits::eSparseResidency;
+	buffer_info.size        = size;
+	buffer_info.usage       = flags;
+	buffer_info.sharingMode = vk::SharingMode::eExclusive;
+	RequireVulkanSuccess(graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer),
+	                     "create sparse buffer");
+	vk::MemoryRequirements requirements {};
+	graphics.device.getBufferMemoryRequirements(m_buffer, &requirements);
+	EXIT_IF(requirements.alignment == 0 || requirements.memoryTypeBits == 0);
+	m_chunk_size       = Common::AlignUp(std::max<uint64_t>(SPARSE_CHUNK_MIN, requirements.alignment),
+	                                     requirements.alignment);
+	m_memory_type_bits = requirements.memoryTypeBits;
+	m_chunks.assign(static_cast<size_t>((size + m_chunk_size - 1) / m_chunk_size), nullptr);
+}
+
 Buffer::~Buffer() {
+	if (m_sparse) {
+		// Unbinding is implicit: the buffer goes first, then the memory it was bound to.
+		if (m_buffer != nullptr) {
+			m_graphics->device.destroyBuffer(m_buffer, nullptr);
+		}
+		if (m_pool != nullptr) {
+			m_graphics->device.destroyCommandPool(m_pool, nullptr);
+		}
+		for (auto* chunk: m_chunks) {
+			if (chunk != nullptr) {
+				vmaFreeMemory(m_graphics->allocator, chunk);
+			}
+		}
+		return;
+	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
+}
+
+uint64_t Buffer::ResidentBytes() const noexcept {
+	return m_sparse ? m_resident_bytes : m_size;
+}
+
+void Buffer::MakeResident(uint64_t offset, uint64_t size) {
+	if (!m_sparse || size == 0) {
+		return;
+	}
+	EXIT_IF(offset > m_size || size > m_size - offset);
+	const auto first = offset / m_chunk_size;
+	const auto last  = (offset + size - 1) / m_chunk_size;
+	std::vector<uint64_t> missing;
+	for (auto chunk = first; chunk <= last; ++chunk) {
+		if (m_chunks[chunk] == nullptr) {
+			missing.push_back(chunk);
+		}
+	}
+	if (missing.empty()) {
+		return;
+	}
+	KYTY_PROFILER_FUNCTION();
+	auto& graphics = *m_graphics;
+	// Newly bound memory holds garbage until it is zeroed, and submitted work may read these
+	// pages (as unmapped, expecting zero): let it finish first. The command buffer being
+	// recorded is left alone; it is submitted after the bind and the fill below.
+	if (const auto tick = Scheduler().CurrentTick(); tick > 1) {
+		Scheduler().Wait(tick - 1);
+	}
+
+	std::vector<vk::SparseMemoryBind> binds;
+	binds.reserve(missing.size());
+	for (const auto chunk: missing) {
+		const auto start  = chunk * m_chunk_size;
+		const auto length = std::min(m_chunk_size, m_size - start);
+		VkMemoryRequirements requirements {};
+		requirements.size           = length;
+		requirements.alignment      = m_chunk_size;
+		requirements.memoryTypeBits = m_memory_type_bits;
+		VmaAllocationCreateInfo create {};
+		create.flags         = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+		create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		VmaAllocation     allocation = nullptr;
+		VmaAllocationInfo info {};
+		auto result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
+		if (result != VK_SUCCESS) {
+			// Video memory is over budget: any type the buffer takes, as dense buffers spill.
+			create.flags         = 0;
+			create.requiredFlags = 0;
+			create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+			result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
+		}
+		if (result != VK_SUCCESS) {
+			graphics.LogMemoryBudget();
+			EXIT("Out of memory: %" PRIu64 " KB for the buffer cache page table (%s).\n",
+			     length >> 10u, vk::to_string(static_cast<vk::Result>(result)).c_str());
+		}
+		m_chunks[chunk] = allocation;
+		m_resident_bytes += length;
+		vk::SparseMemoryBind bind {};
+		bind.resourceOffset = start;
+		bind.size           = length;
+		bind.memory         = info.deviceMemory;
+		bind.memoryOffset   = info.offset;
+		binds.push_back(bind);
+	}
+
+	vk::SparseBufferMemoryBindInfo buffer_bind {};
+	buffer_bind.buffer    = m_buffer;
+	buffer_bind.bindCount = static_cast<uint32_t>(binds.size());
+	buffer_bind.pBinds    = binds.data();
+	vk::BindSparseInfo bind_info {};
+	bind_info.bufferBindCount = 1;
+	bind_info.pBufferBinds    = &buffer_bind;
+	vk::FenceCreateInfo fence_info {};
+	vk::Fence           fence {};
+	RequireVulkanSuccess(graphics.device.createFence(&fence_info, nullptr, &fence),
+	                     "create sparse bind fence");
+	{
+		Common::LockGuard lock(graphics.queue_mutex);
+		RequireVulkanSuccess(graphics.queue.bindSparse(1, &bind_info, fence), "vkQueueBindSparse");
+	}
+	RequireVulkanSuccess(graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX),
+	                     "wait for sparse bind");
+	RequireVulkanSuccess(graphics.device.resetFences(1, &fence), "reset sparse bind fence");
+
+	// Newly bound memory is undefined; unmapped entries must read zero, as unbound ones did.
+	// Zeroed in a command buffer of its own, done before the scheduler's next submission.
+	if (m_pool == nullptr) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                             vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		pool_info.queueFamilyIndex = graphics.queue_family;
+		RequireVulkanSuccess(graphics.device.createCommandPool(&pool_info, nullptr, &m_pool),
+		                     "create sparse fill pool");
+	}
+	vk::CommandBufferAllocateInfo allocate {};
+	allocate.commandPool        = m_pool;
+	allocate.level              = vk::CommandBufferLevel::ePrimary;
+	allocate.commandBufferCount = 1;
+	vk::CommandBuffer command {};
+	RequireVulkanSuccess(graphics.device.allocateCommandBuffers(&allocate, &command),
+	                     "allocate sparse fill command buffer");
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(command.begin(&begin), "begin sparse fill");
+	for (const auto& bind: binds) {
+		command.fillBuffer(m_buffer, bind.resourceOffset, bind.size, 0);
+	}
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr, 0,
+	                        nullptr);
+	RequireVulkanSuccess(command.end(), "end sparse fill");
+	vk::SubmitInfo submit {};
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &command;
+	{
+		Common::LockGuard lock(graphics.queue_mutex);
+		RequireVulkanSuccess(graphics.queue.submit(1, &submit, fence), "submit sparse fill");
+	}
+	RequireVulkanSuccess(graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX),
+	                     "wait for sparse fill");
+	graphics.device.freeCommandBuffers(m_pool, 1, &command);
+	graphics.device.destroyFence(fence, nullptr);
 }
 
 vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {

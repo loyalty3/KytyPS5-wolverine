@@ -631,6 +631,33 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
 	LOGF("Vulkan shaderResourceMinLod (IMAGE_SAMPLE*_CL): %s\n",
 	     shader_resource_min_lod ? "true" : "false");
+	// Sparse residency for the buffer cache's page table (BufferCache): the table spans the
+	// guest's whole 1.5 TiB address range, 768 MB dense, while a title touches a few GB of it.
+	// Unbound pages must read as zero (residencyNonResidentStrict), as the dense table's
+	// unmapped entries do; the queue must take sparse binds. Otherwise the table stays dense.
+	{
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		const bool queue_sparse =
+		    queue_family < family_count &&
+		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+		const bool sparse = queue_sparse &&
+		                    supported_features2.features.sparseBinding == VK_TRUE &&
+		                    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
+		                    properties2.properties.sparseProperties.residencyNonResidentStrict ==
+		                        VK_TRUE &&
+		                    std::getenv("KYTY_DENSE_PAGETABLE") == nullptr;
+		device_features.sparseBinding         = sparse ? VK_TRUE : VK_FALSE;
+		device_features.sparseResidencyBuffer = sparse ? VK_TRUE : VK_FALSE;
+		graphics.sparse_buffer_enabled        = sparse;
+		LOGF("Vulkan sparse page table: %s (queue %s, binding %u, residency %u, strict %u)\n",
+		     sparse ? "on" : "off", queue_sparse ? "yes" : "no",
+		     supported_features2.features.sparseBinding,
+		     supported_features2.features.sparseResidencyBuffer,
+		     properties2.properties.sparseProperties.residencyNonResidentStrict);
+	}
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;

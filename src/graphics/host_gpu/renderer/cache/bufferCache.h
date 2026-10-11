@@ -87,7 +87,7 @@ public:
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer*       GetGdsBuffer() noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return m_bda_pagetable_buffer.get(); }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	// GPU write bitmap (KYTY_WRITE_BITMAP=1, rework.md Phase 2 first step): one bit per 4 KiB
@@ -135,6 +135,8 @@ public:
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
 
 private:
+	[[nodiscard]] static std::unique_ptr<Buffer> MakePageTable(GraphicContext&   graphics,
+	                                                            CommandScheduler& scheduler);
 	friend struct BufferCacheTestAccess;
 
 	void ReleaseBuffer(BufferId id);
@@ -191,7 +193,7 @@ private:
 	CommandScheduler&                                  m_scheduler;
 	FaultManager                                       m_fault_manager;
 	Buffer                                             m_gds_buffer;
-	Buffer                                             m_bda_pagetable_buffer;
+	std::unique_ptr<Buffer>                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;

@@ -254,25 +254,86 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
+namespace {
+// KYTY_DEDICATED_IMAGE_KB (default 2048; 0 = off): images at least this large get video memory of
+// their own instead of a place in one of VMA's shared 256 MB blocks. A block goes back to the
+// driver only when every image in it is gone, and the texture cache frees images one by one as
+// the guest streams: with ~3 MB textures, 85 to a block, freeing 60 % of them returned nothing
+// (textures 4.3 -> 1.8 GB while the card stayed at 10.3 GB, 2026-10-10). Small images stay in
+// blocks, where their count would otherwise approach the driver's allocation limit.
+uint64_t DedicatedImageThreshold() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_DEDICATED_IMAGE_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {2048}) * 1024u;
+	}();
+	return bytes;
+}
+
+std::atomic<uint64_t> g_dedicated_images {0};
+std::atomic<uint64_t> g_dedicated_image_bytes {0};
+} // namespace
+
+uint64_t GraphicContext::AllocationSize(VmaAllocation allocation) const {
+	if (allocator == nullptr || allocation == nullptr) {
+		return 0;
+	}
+	VmaAllocationInfo info {};
+	vmaGetAllocationInfo(allocator, allocation, &info);
+	return info.size;
+}
+
+uint64_t GraphicContext::DedicatedImageCount() {
+	return g_dedicated_images.load(std::memory_order_relaxed);
+}
+
+uint64_t GraphicContext::DedicatedImageBytes() {
+	return g_dedicated_image_bytes.load(std::memory_order_relaxed);
+}
+
 bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
+	vk::Image native_image {};
+	auto      result = device.createImage(&image_info, nullptr, &native_image);
+	if (result != vk::Result::eSuccess) {
+		LOGF("vkCreateImage failed: %s (%ux%ux%u layers=%u levels=%u format=%d)\n",
+		     vk::to_string(result).c_str(), image_info.extent.width, image_info.extent.height,
+		     image_info.extent.depth, image_info.arrayLayers, image_info.mipLevels,
+		     static_cast<int>(image_info.format));
+		return false;
+	}
+	vk::MemoryRequirements requirements {};
+	device.getImageMemoryRequirements(native_image, &requirements);
+
+	bool dedicated = false;
+	if (const auto threshold = DedicatedImageThreshold(); threshold != 0 && requirements.size >= threshold) {
+		// Every dedicated image is one of the driver's memory objects; keep well clear of its
+		// limit (4096 on some drivers), counting the blocks and dedicated buffers already made.
+		VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+		vmaGetHeapBudgets(allocator, budgets);
+		uint64_t objects = 0;
+		for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+			objects += budgets[heap].statistics.blockCount;
+		}
+		const uint64_t limit = physical_device_properties.limits.maxMemoryAllocationCount;
+		dedicated            = objects + 512 < limit;
+	}
+
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-	vk::Image::CType native_image = VK_NULL_HANDLE;
-	auto             result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (dedicated) {
+		alloc_info.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+	}
+	result = static_cast<vk::Result>(
+	    vmaAllocateMemoryForImage(allocator, native_image, &alloc_info, &image.allocation, nullptr));
 	if (result != vk::Result::eSuccess) {
 		// The device heap is full. The guest has a unified 16 GB pool, so the image is
 		// real; place it in host memory and pay in bandwidth rather than fail.
 		alloc_info.requiredFlags  = 0;
 		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-		result                    = static_cast<vk::Result>(vmaCreateImage(
-            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-            &alloc_info, &native_image, &image.allocation, nullptr));
+		result                    = static_cast<vk::Result>(vmaAllocateMemoryForImage(
+            allocator, native_image, &alloc_info, &image.allocation, nullptr));
 		static std::atomic<uint32_t> spill_count {0};
 		if (const auto seen = spill_count.fetch_add(1, std::memory_order_relaxed); seen < 32) {
 			LOGF("Image spilled to host memory (%u): %ux%ux%u layers=%u levels=%u format=%d -> %s\n",
@@ -281,10 +342,24 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 			     static_cast<int>(image_info.format), vk::to_string(result).c_str());
 		}
 	}
-	image.image = native_image;
+	if (result == vk::Result::eSuccess) {
+		result = static_cast<vk::Result>(vmaBindImageMemory(allocator, image.allocation, native_image));
+		if (result != vk::Result::eSuccess) {
+			LOGF("vmaBindImageMemory failed: %s\n", vk::to_string(result).c_str());
+			vmaFreeMemory(allocator, image.allocation);
+			image.allocation = nullptr;
+		}
+	}
 	if (result != vk::Result::eSuccess) {
+		device.destroyImage(native_image, nullptr);
 		LogMemoryBudget();
 		return false;
+	}
+	image.image     = native_image;
+	image.dedicated = dedicated;
+	if (dedicated) {
+		g_dedicated_images.fetch_add(1, std::memory_order_relaxed);
+		g_dedicated_image_bytes.fetch_add(requirements.size, std::memory_order_relaxed);
 	}
 
 	image.format     = image_info.format;
@@ -305,9 +380,16 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
+	if (image.dedicated) {
+		VmaAllocationInfo info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &info);
+		g_dedicated_images.fetch_sub(1, std::memory_order_relaxed);
+		g_dedicated_image_bytes.fetch_sub(info.size, std::memory_order_relaxed);
+	}
 	vmaDestroyImage(allocator, image.image, image.allocation);
 	image.image      = nullptr;
 	image.allocation = nullptr;
+	image.dedicated  = false;
 }
 
 } // namespace Libs::Graphics

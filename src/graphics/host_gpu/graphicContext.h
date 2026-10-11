@@ -71,6 +71,8 @@ struct GraphicContext {
 	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
 	// bound and updated after bind.
 	bool                               bindless_enabled                      = false;
+	// sparseBinding + sparseResidencyBuffer with strict non-resident reads, on the one queue.
+	bool                               sparse_buffer_enabled                 = false;
 	uint32_t                           bindless_max_sampled_images           = 0;
 	uint32_t                           bindless_max_samplers                 = 0;
 	vk::DescriptorSetLayout            bindless_layout                       = nullptr;
@@ -178,6 +180,10 @@ struct GraphicContext {
 	}
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	// Images in video memory of their own (KYTY_DEDICATED_IMAGE_KB), for the KYTY_PERF report.
+	[[nodiscard]] uint64_t AllocationSize(VmaAllocation allocation) const;
+	[[nodiscard]] static uint64_t DedicatedImageCount();
+	[[nodiscard]] static uint64_t DedicatedImageBytes();
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
@@ -214,6 +220,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// In a VkDeviceMemory of its own (GraphicContext::CreateImage), not a shared block.
+	bool                          dedicated  = false;
 };
 
 

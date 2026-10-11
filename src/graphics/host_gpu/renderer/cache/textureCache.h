@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 
+#include "graphics/host_gpu/perfMonitor.h"
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
@@ -146,6 +147,8 @@ private:
 	void                      DeleteImage(ImageId id);
 	void                      ReleaseImage(ImageId id);
 	void                      FreeImage(ImageId id);
+	// FreeImage, counted under this reason in the KYTY_PERF churn line.
+	void                      FreeImage(ImageId id, PerfMonitor::TextureEvent reason);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
@@ -232,6 +235,8 @@ private:
 	std::vector<ImageId>                              m_guest_dropped;
 	uint64_t                                          m_guest_dropped_freed       = 0;
 	uint64_t                                          m_guest_dropped_freed_bytes = 0;
+	// Why the image being deleted goes (KYTY_PERF); anything not set is a replacement.
+	PerfMonitor::TextureEvent                         m_free_reason = PerfMonitor::TextureEvent::FreedReplaced;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	// Evictions are budgeted per frame, not per collector run: see RunGarbageCollector.

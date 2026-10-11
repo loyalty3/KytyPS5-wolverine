@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/perfMonitor.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
@@ -2224,6 +2225,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
+		if (stage->runtime->program->has_address_writes) {
+			PerfMonitor::AddAddressWriteShader();
+		}
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();

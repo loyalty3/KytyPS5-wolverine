@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/perfMonitor.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
@@ -584,6 +585,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
 	FindBuffers(bindings);
+	if (program.has_address_writes) {
+		PerfMonitor::AddAddressWriteShader();
+	}
 	if (program.info.uses_dma) {
 		KYTY_PROFILER_BLOCK("Dispatch::PrepareBda");
 		m_context.PrepareBda();
@@ -734,6 +738,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	if (program.has_address_writes) {
+		PerfMonitor::AddAddressWriteShader();
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}

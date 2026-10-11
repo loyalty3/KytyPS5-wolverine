@@ -30,6 +30,8 @@
 #include <unordered_set>
 #include <span>
 #include <tuple>
+#include <utility>
+#include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
@@ -319,6 +321,8 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	Profiler::Add(Profiler::Counter::ImagesCreated);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
+		PerfMonitor::AddTextureEvent(PerfMonitor::TextureEvent::Created,
+		                             Common::AlignUp(info.data.size, 1024));
 	}
 	return id;
 }
@@ -402,6 +406,7 @@ void TextureCache::DeleteImage(ImageId id) {
 			m_surface_metas.erase(metadata);
 		}
 	}
+	PerfMonitor::AddTextureEvent(m_free_reason, image->AccountedSize());
 	UnregisterImage(id);
 	// Also between guest command buffers (a guest unmap runs there): command buffers submitted
 	// earlier may still be sampling the image on the GPU. Destroying it at once let them read
@@ -438,6 +443,12 @@ void TextureCache::FreeImage(ImageId id) {
 		image.ClearGpuModified();
 	}
 	DeleteImage(id);
+}
+
+void TextureCache::FreeImage(ImageId id, PerfMonitor::TextureEvent reason) {
+	const auto previous = std::exchange(m_free_reason, reason);
+	FreeImage(id);
+	m_free_reason = previous;
 }
 
 void TextureCache::TouchImage(Image& image) {
@@ -2199,7 +2210,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
-		FreeImage(id);
+		FreeImage(id, PerfMonitor::TextureEvent::FreedUnmap);
 	}
 }
 
@@ -2259,7 +2270,7 @@ void TextureCache::RunGarbageCollector() {
 		const auto freed = image->AccountedSize();
 		g_gc_skip.freed++;
 		g_gc_skip.freed_mb += freed >> 20u;
-		FreeImage(pending.id);
+		FreeImage(pending.id, PerfMonitor::TextureEvent::FreedCollector);
 		return true;
 	});
 	// Memory pressure (GraphicContext::MemoryShortfall: device use past 90 % of the video memory
@@ -2308,7 +2319,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 			m_guest_dropped_freed++;
 			m_guest_dropped_freed_bytes += image->AccountedSize();
-			FreeImage(id);
+			FreeImage(id, PerfMonitor::TextureEvent::FreedGuestDrop);
 			return true;
 		});
 		if (m_gc_tick % 500 == 0) {
@@ -2346,11 +2357,16 @@ void TextureCache::RunGarbageCollector() {
 	if (PerfMonitor::SnapshotDueTexture()) {
 		PerfMonitor::TextureSnapshot snapshot;
 		snapshot.pressure_mark = m_pressure_gc_memory;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges; // guest address, guest size
 		m_slot_images.ForEach([&](ImageId, const Image& image) {
 			if (!image.registered) {
 				return;
 			}
 			const auto size = image.AccountedSize();
+			if (image.backing.allocation != nullptr) {
+				snapshot.real_bytes += m_graphics.AllocationSize(image.backing.allocation);
+			}
+			ranges.emplace_back(image.info.data.address, image.info.data.size);
 			snapshot.images++;
 			snapshot.total_bytes += size;
 			if (image.bindless_pinned) {
@@ -2363,6 +2379,16 @@ void TextureCache::RunGarbageCollector() {
 				snapshot.gpu_bytes += size;
 			}
 		});
+		// Images whose guest bytes an image earlier in address order already covers: format or
+		// view-type aliases of one texture, each with video memory of its own.
+		std::sort(ranges.begin(), ranges.end());
+		uint64_t covered_end = 0;
+		for (const auto& [address, size]: ranges) {
+			if (address < covered_end) {
+				snapshot.duplicate_bytes += Common::AlignUp(size, 1024);
+			}
+			covered_end = std::max(covered_end, address + size);
+		}
 		PerfMonitor::SetTextureSnapshot(snapshot);
 	}
 	if (CollectableMemory() < m_trigger_gc_memory) {
@@ -2452,6 +2478,8 @@ void TextureCache::RunGarbageCollector() {
 				g_gc_skip.small_target++;
 				continue;
 			}
+			const auto reason = owner->bindless_pinned ? PerfMonitor::TextureEvent::FreedBindless
+			                                           : PerfMonitor::TextureEvent::FreedCollector;
 			if (owner->bindless_pinned) {
 				// Pinned for bindless draws; under pressure one no draw sampled during the last
 				// usage probe may go (ISSUES #15: on 4-8 GB cards these grew to 2-5 GB and never
@@ -2519,7 +2547,7 @@ void TextureCache::RunGarbageCollector() {
 			const auto freed = owner->AccountedSize();
 			g_gc_skip.freed++;
 			g_gc_skip.freed_mb += freed >> 20u;
-			FreeImage(id);
+			FreeImage(id, reason);
 			if (pressured || aggressive) {
 				--deletions;
 				m_gc_freed_images_frame++;
