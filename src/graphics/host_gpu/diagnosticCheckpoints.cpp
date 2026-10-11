@@ -46,6 +46,14 @@ void Print(const char* stage, const DiagnosticCheckpoint& checkpoint) {
 	     checkpoint.arg1, checkpoint.arg2, checkpoint.arg3, checkpoint.arg4);
 	// A dispatch records its CS code address in arg4: name the shader by the hash
 	// --skip-shaders takes, so a shader that loses the device can be stepped past.
+	if ((checkpoint.op == 1 || checkpoint.op == 2) && checkpoint.arg5 != 0) {
+		const auto ps = checkpoint.arg4 != 0 ? ShaderDeclaredHash(checkpoint.arg4) : 0;
+		const auto vs = checkpoint.arg5 != 0 ? ShaderDeclaredHash(checkpoint.arg5) : 0;
+		std::printf("  [%s] draw shaders: vertex hash=0x%016" PRIx64 " pixel hash=0x%016" PRIx64 "\n",
+		            stage, vs, ps);
+		LOGF("  [%s] draw shaders: vertex hash=0x%016" PRIx64 " pixel hash=0x%016" PRIx64 "\n",
+		     stage, vs, ps);
+	}
 	if (checkpoint.op == 0 && checkpoint.arg4 != 0) {
 		const auto hash = ShaderDeclaredHash(checkpoint.arg4);
 		std::printf("  [%s] dispatch shader hash=0x%016" PRIx64 "\n", stage, hash);

@@ -121,7 +121,7 @@ public:
 	[[nodiscard]] bool IsInvalid() const;
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
-	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
+	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0, uint64_t arg5 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 

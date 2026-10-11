@@ -27,6 +27,8 @@ struct DiagnosticCheckpoint {
 	uint32_t arg2      = 0;
 	uint32_t arg3      = 0;
 	uint64_t arg4      = 0;
+	// Draws: the vertex-stage shader's code address (arg4 holds the pixel shader's).
+	uint64_t arg5      = 0;
 	uint64_t sequence  = 0;
 };
 

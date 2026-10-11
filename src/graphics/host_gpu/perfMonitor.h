@@ -37,6 +37,9 @@ void AddGpuThreadBlocked(double seconds);
 
 // A game thread waited this long for GPU-written memory to come back (any thread).
 void AddGameReadbackWait(double seconds);
+// The same, with the guest address the game touched (the report names the 1 MB regions whose
+// waits cost most) and whether it was writing.
+void AddGameReadbackWait(double seconds, uint64_t address, bool write);
 
 // A frame was presented (any thread).
 void FramePresented();

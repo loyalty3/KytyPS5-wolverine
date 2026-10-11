@@ -1422,6 +1422,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	KYTY_PROFILER_FUNCTION();
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -1506,6 +1507,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 }
 
 void TextureCache::UpdateImage(ImageId id) {
+	KYTY_PROFILER_FUNCTION();
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1555,6 +1557,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	KYTY_PROFILER_FUNCTION();
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -2249,6 +2252,7 @@ void TextureCache::ReleaseDroppedByGuest(ImageId id) {
 }
 
 void TextureCache::RunGarbageCollector() {
+	KYTY_PROFILER_FUNCTION();
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
 	const uint64_t clock = LruClock();

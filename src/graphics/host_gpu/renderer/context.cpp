@@ -64,7 +64,7 @@ void CommandBuffer::End() const {
 }
 
 void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
-                                 uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+                                 uint32_t arg2, uint32_t arg3, uint64_t arg4, uint64_t arg5) {
 	m_debug_op        = op;
 	m_debug_submit_id = submit_id;
 	m_debug_arg0      = arg0;
@@ -79,7 +79,8 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 		                                                 .arg1      = arg1,
 		                                                 .arg2      = arg2,
 		                                                 .arg3      = arg3,
-		                                                 .arg4      = arg4});
+		                                                 .arg4      = arg4,
+		                                                 .arg5      = arg5});
 		if (marker != nullptr) {
 			Recorder().setCheckpointNV(marker);
 		}

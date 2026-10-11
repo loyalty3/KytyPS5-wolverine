@@ -509,14 +509,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// KYTY_PERF: how long the game's own threads stand still waiting for GPU-written memory.
 	struct ReadbackTimer {
 		bool                                  active;
+		uint64_t                              address;
+		bool                                  write;
 		std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 		~ReadbackTimer() {
 			if (active) {
 				PerfMonitor::AddGameReadbackWait(
-				    std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+				    std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count(),
+				    address, write);
 			}
 		}
-	} readback_timer {!from_gpu_thread && PerfMonitor::Enabled()};
+	} readback_timer {!from_gpu_thread && PerfMonitor::Enabled(), vaddr, is_write};
 	for (;;) {
 		uint64_t wait_tick = 0;
 		m_scheduler.Context().GetGpu().SendCommandSync(

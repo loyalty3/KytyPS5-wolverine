@@ -1803,6 +1803,7 @@ void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_
 // count. Keys outside it, and heaps that cannot be read, use the default sampler in slot 0.
 void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
                                              PreparedBindings&         prepared) {
+	KYTY_PROFILER_FUNCTION();
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	if (snapshot.bindless_sampler_heaps.empty()) {
@@ -2221,6 +2222,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
+	KYTY_PROFILER_FUNCTION();
 	bool uses_dma = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);

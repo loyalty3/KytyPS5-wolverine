@@ -175,6 +175,50 @@ struct Lifecycle {
 
 } // namespace Profiler
 
+namespace Profiler {
+// KYTY_PERF_ZONES=1 (with KYTY_PERF): the profiler zones the GPU thread passes through are timed
+// without Tracy, and the KYTY_PERF report lists where its time went, by zone, each zone's own
+// time (its inner zones' taken out). Off: one predictable branch per zone.
+inline bool g_perf_zones = false;
+struct PerfZoneStats {
+	const tracy::SourceLocationData* location = nullptr;
+	int64_t                          self_ns  = 0;
+	int64_t                          total_ns = 0;
+	int64_t                          calls    = 0;
+};
+// The GPU thread's table (open addressing on the location pointer). Read and reset on that
+// thread only (PerfMonitor::Tick).
+inline constexpr size_t kPerfZoneSlots = 1024;
+PerfZoneStats* PerfZoneTable();
+int64_t        PerfZoneNow();
+class PerfZone {
+public:
+	explicit PerfZone(const tracy::SourceLocationData* location) {
+		if (!g_perf_zones || !t_gpu_thread) {
+			return;
+		}
+		m_location = location;
+		m_parent   = s_top;
+		s_top      = this;
+		m_start    = PerfZoneNow();
+	}
+	~PerfZone() {
+		if (m_location != nullptr) {
+			Finish();
+		}
+	}
+	KYTY_CLASS_NO_COPY(PerfZone);
+
+private:
+	void Finish();
+	const tracy::SourceLocationData* m_location = nullptr;
+	PerfZone*                        m_parent   = nullptr;
+	int64_t                          m_start    = 0;
+	int64_t                          m_child_ns = 0;
+	static inline thread_local PerfZone* s_top = nullptr;
+};
+} // namespace Profiler
+
 #define KYTY_PROFILER_CONCAT_IMPL(a, b) a##b
 #define KYTY_PROFILER_CONCAT(a, b)      KYTY_PROFILER_CONCAT_IMPL(a, b)
 #define KYTY_PROFILER_COLOR_OR_DEFAULT(default_color, ...)                                         \
@@ -190,7 +234,9 @@ struct Lifecycle {
 	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
 	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                           \
 	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line),                              \
-	    TRACY_CALLSTACK, tracy::ProfilerAvailable() && Profiler::g_zones)
+	    TRACY_CALLSTACK, tracy::ProfilerAvailable() && Profiler::g_zones);                         \
+	Profiler::PerfZone KYTY_PROFILER_CONCAT(kyty_perf_zone_, line)(                               \
+	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line))
 
 #define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)
 

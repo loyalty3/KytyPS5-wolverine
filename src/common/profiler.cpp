@@ -5,6 +5,7 @@
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -199,6 +200,41 @@ void Shutdown() {
 	g_counters = false;
 	if (tracy::ProfilerAvailable()) {
 		tracy::ShutdownProfiler();
+	}
+}
+
+} // namespace Profiler
+
+namespace Profiler {
+
+PerfZoneStats* PerfZoneTable() {
+	static PerfZoneStats table[kPerfZoneSlots] {};
+	return table;
+}
+
+int64_t PerfZoneNow() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+void PerfZone::Finish() {
+	const auto elapsed = PerfZoneNow() - m_start;
+	s_top              = m_parent;
+	if (m_parent != nullptr) {
+		m_parent->m_child_ns += elapsed;
+	}
+	auto*      table = PerfZoneTable();
+	const auto hash  = (reinterpret_cast<uintptr_t>(m_location) >> 4u) * 0x9E3779B97F4A7C15ull;
+	for (size_t probe = 0; probe < kPerfZoneSlots; probe++) {
+		auto& slot = table[(hash + probe) & (kPerfZoneSlots - 1)];
+		if (slot.location == m_location || slot.location == nullptr) {
+			slot.location = m_location;
+			slot.self_ns += elapsed - m_child_ns;
+			slot.total_ns += elapsed;
+			slot.calls++;
+			return;
+		}
 	}
 }
 

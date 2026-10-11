@@ -108,6 +108,16 @@ void ScanLargeBuffers(std::array<std::pair<uint64_t, uint64_t>, BufferSnapshot::
 	g_scan_running.store(false, std::memory_order_release);
 }
 
+// Readback waits by 1 MB guest region: the regions the game's threads stand still on.
+struct ReadbackRegion {
+	uint64_t region   = 0;
+	uint64_t count    = 0;
+	uint64_t writes   = 0;
+	int64_t  wait_ns  = 0;
+};
+std::mutex                  g_readback_mutex;
+std::vector<ReadbackRegion> g_readback_regions;
+
 // Owned by the GPU thread (Tick).
 Clock::time_point g_window_start {};
 std::array<int64_t, static_cast<size_t>(Profiler::Counter::Total)> g_last_counters {};
@@ -139,11 +149,13 @@ void Initialize(GraphicContext* graphics) {
 	if (!g_enabled) {
 		return;
 	}
+	const char* zones      = std::getenv("KYTY_PERF_ZONES");
+	Profiler::g_perf_zones = zones != nullptr && zones[0] == '1';
 	g_graphics = graphics;
 	// The draw, dispatch, wait and readback counters (Profiler::Add) count only while this is on.
 	Profiler::g_counters = true;
 	g_window_start       = Clock::now();
-	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 6), a report every %.0f s\n", KYTY_BUILD_LABEL,
+	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 7), a report every %.0f s\n", KYTY_BUILD_LABEL,
 	            kReportSeconds);
 	std::fflush(stdout);
 }
@@ -174,6 +186,27 @@ void AddGameReadbackWait(double seconds) {
 	while (ns > max &&
 	       !g_readback_max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
 	}
+}
+
+void AddGameReadbackWait(double seconds, uint64_t address, bool write) {
+	if (!g_enabled) {
+		return;
+	}
+	AddGameReadbackWait(seconds);
+	const auto       region = address >> 20u;
+	std::scoped_lock lock(g_readback_mutex);
+	auto found = std::find_if(g_readback_regions.begin(), g_readback_regions.end(),
+	                          [&](const ReadbackRegion& entry) { return entry.region == region; });
+	if (found == g_readback_regions.end()) {
+		if (g_readback_regions.size() >= 4096) {
+			return;
+		}
+		g_readback_regions.push_back({region});
+		found = std::prev(g_readback_regions.end());
+	}
+	found->count++;
+	found->writes += write ? 1 : 0;
+	found->wait_ns += ToNs(seconds);
 }
 
 void FramePresented() {
@@ -385,6 +418,52 @@ void Tick() {
 				g_scan_last = now;
 				std::thread(ScanLargeBuffers, g_buf_snapshot.large, g_buf_snapshot.large_count).detach();
 			}
+		}
+	}
+	{
+		std::vector<ReadbackRegion> regions;
+		{
+			std::scoped_lock lock(g_readback_mutex);
+			regions.swap(g_readback_regions);
+		}
+		std::sort(regions.begin(), regions.end(),
+		          [](const auto& a, const auto& b) { return a.wait_ns > b.wait_ns; });
+		if (!regions.empty()) {
+			std::printf("Perf readbacks (1 MB regions the game waited on most):");
+			for (size_t i = 0; i < std::min<size_t>(regions.size(), 6); i++) {
+				std::printf(" 0x%010" PRIx64 " %" PRIu64 "x (%" PRIu64 " writing) %.0f ms;",
+				            regions[i].region << 20u, regions[i].count, regions[i].writes,
+				            static_cast<double>(regions[i].wait_ns) / 1e6);
+			}
+			std::printf(" %zu regions in all\n", regions.size());
+		}
+	}
+	if (Profiler::g_perf_zones) {
+		auto*                                 table = Profiler::PerfZoneTable();
+		std::vector<Profiler::PerfZoneStats*> zones;
+		int64_t                               self_total = 0;
+		for (size_t i = 0; i < Profiler::kPerfZoneSlots; i++) {
+			if (table[i].location != nullptr && table[i].calls != 0) {
+				zones.push_back(&table[i]);
+				self_total += table[i].self_ns;
+			}
+		}
+		std::sort(zones.begin(), zones.end(),
+		          [](const auto* a, const auto* b) { return a->self_ns > b->self_ns; });
+		std::printf("Perf zones (GPU thread, own time, %.0f%% of the window inside zones):",
+		            100.0 * static_cast<double>(self_total) / window_ns);
+		for (size_t i = 0; i < std::min<size_t>(zones.size(), 16); i++) {
+			const auto* zone = zones[i];
+			const char* name = zone->location->name != nullptr ? zone->location->name
+			                                                   : zone->location->function;
+			std::printf("%s %s %.1f%% (%.0f/frame, %.1f us)", i == 0 ? "" : ";", name,
+			            100.0 * static_cast<double>(zone->self_ns) / window_ns,
+			            static_cast<double>(zone->calls) / per_frame_divisor,
+			            static_cast<double>(zone->self_ns) / 1000.0 / static_cast<double>(zone->calls));
+		}
+		std::printf("\n");
+		for (size_t i = 0; i < Profiler::kPerfZoneSlots; i++) {
+			table[i].self_ns = table[i].total_ns = table[i].calls = 0;
 		}
 	}
 	std::fflush(stdout);
