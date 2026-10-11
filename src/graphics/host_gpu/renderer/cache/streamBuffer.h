@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -63,6 +64,18 @@ public:
 		return !m_sparse || m_chunks[offset / m_chunk_size] != 0;
 	}
 	[[nodiscard]] uint64_t ChunkSize() const noexcept { return m_sparse ? m_chunk_size : m_size; }
+	// Sparse: bytes of [offset, offset+size) whose chunks are not bound yet (whole chunks).
+	[[nodiscard]] uint64_t UnboundBytes(uint64_t offset, uint64_t size) const noexcept {
+		if (!m_sparse || size == 0 || offset >= m_size) {
+			return 0;
+		}
+		const auto last  = (std::min(offset + size, m_size) - 1) / m_chunk_size;
+		uint64_t   bytes = 0;
+		for (auto chunk = offset / m_chunk_size; chunk <= last; chunk++) {
+			bytes += m_chunks[chunk] == 0 ? m_chunk_size : 0;
+		}
+		return bytes;
+	}
 	// Bytes bound so far (sparse), or the whole size (dense).
 	[[nodiscard]] uint64_t ResidentBytes() const noexcept;
 

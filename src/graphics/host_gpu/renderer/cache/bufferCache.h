@@ -179,8 +179,7 @@ private:
 	                                           bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::vector<vk::BufferCopy>& copies,
 	                                      uint64_t total_size);
-	void FilterSparseCopies(Buffer& buffer, const uint8_t* data, uint64_t bias,
-	                        std::vector<vk::BufferCopy>& copies);
+	void FilterSparseCopies(Buffer& buffer, std::vector<vk::BufferCopy>& copies);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,

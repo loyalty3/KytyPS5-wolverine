@@ -248,7 +248,7 @@ public:
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
-		BumpCoverage(start, size);
+		BumpCoverage(start, size, IsCommittedRangeType(type));
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -479,8 +479,10 @@ public:
 	// the per-thread answers were thrown away on every change: the GPU thread then spent up to
 	// 60 % of its time in ClampRangeSize (Wolverine combat, 2026-10-11). False when unsure (the
 	// log wrapped, or an entry is being written).
-	[[nodiscard]] bool CoverageUnchanged(uint64_t from, uint64_t to, uint64_t start,
-	                                     uint64_t end) const noexcept {
+	// whole: the answer covered the whole range, so changes that only commit bytes cannot alter
+	// it (the game streams into heaps its descriptors span).
+	[[nodiscard]] bool CoverageUnchanged(uint64_t from, uint64_t to, uint64_t start, uint64_t end,
+	                                     bool whole) const noexcept {
 		if (to < from || to - from >= kCoverageLog) {
 			return false;
 		}
@@ -491,11 +493,12 @@ public:
 			}
 			const auto change_start = change.start.load(std::memory_order_relaxed);
 			const auto change_end   = change.end.load(std::memory_order_relaxed);
+			const bool additive     = change.additive.load(std::memory_order_relaxed);
 			std::atomic_thread_fence(std::memory_order_acquire);
 			if (change.generation.load(std::memory_order_relaxed) != generation) {
 				return false;
 			}
-			if (change_start < end && start < change_end) {
+			if (change_start < end && start < change_end && !(whole && additive)) {
 				return false;
 			}
 		}
@@ -784,15 +787,19 @@ private:
 		std::atomic<uint64_t> generation {0};
 		std::atomic<uint64_t> start {0};
 		std::atomic<uint64_t> end {0};
+		std::atomic<bool>     additive {false};
 	};
 	std::array<CoverageChange, kCoverageLog> m_coverage_log {};
-	void BumpCoverage(uint64_t start, uint64_t size) {
+	// additive: the change only commits bytes (Add of a committed type), so a range that was
+	// wholly committed stays so.
+	void BumpCoverage(uint64_t start, uint64_t size, bool additive = false) {
 		const auto generation = m_coverage_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 		auto&      change     = m_coverage_log[generation % kCoverageLog];
 		change.generation.store(0, std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_release);
 		change.start.store(start, std::memory_order_relaxed);
 		change.end.store(End(start, size), std::memory_order_relaxed);
+		change.additive.store(additive, std::memory_order_relaxed);
 		change.generation.store(generation, std::memory_order_release);
 	}
 	std::vector<Span>     m_spans;
@@ -1116,7 +1123,8 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 		}
 		// Memory was mapped or unmapped since: only a change inside the range alters the answer.
 		const auto end = UINT64_MAX - vaddr < size ? UINT64_MAX : vaddr + size;
-		if (g_virtual_ranges->CoverageUnchanged(answer.generation, generation, vaddr, end)) {
+		if (g_virtual_ranges->CoverageUnchanged(answer.generation, generation, vaddr, end,
+		                                        answer.clamped == size)) {
 			answer.generation = generation;
 			return answer.clamped;
 		}

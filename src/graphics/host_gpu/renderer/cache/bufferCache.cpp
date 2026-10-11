@@ -106,11 +106,14 @@ bool AllZero(const uint8_t* data, uint64_t size) {
 }
 } // namespace
 
+static void ReadGuestForUpload(uint8_t* destination, uint64_t address, uint64_t size);
+
 // Upload copies into a sparse buffer: a piece that lands in an unbound chunk and holds only zeros
-// is dropped (unbound memory reads as zero); the chunks the rest lands in are bound first. data
-// points at the staged bytes of the copy whose srcOffset is bias.
-void BufferCache::FilterSparseCopies(Buffer& buffer, const uint8_t* data, uint64_t bias,
-                                     std::vector<vk::BufferCopy>& copies) {
+// is dropped (unbound memory reads as zero); the chunks the rest lands in are bound first. The
+// zeros are checked in the guest's own (cached) memory: the staged copy is write-combined, and
+// reading it back ran at ~90 MB/s, 30 s for the geometry pool's first upload (2026-10-11).
+void BufferCache::FilterSparseCopies(Buffer& buffer, std::vector<vk::BufferCopy>& copies) {
+	thread_local std::vector<uint8_t> scratch;
 	const auto chunk = buffer.ChunkSize();
 	std::vector<vk::BufferCopy>                 kept;
 	std::vector<std::pair<uint64_t, uint64_t>> bind;
@@ -122,7 +125,13 @@ void BufferCache::FilterSparseCopies(Buffer& buffer, const uint8_t* data, uint64
 			const auto length      = std::min(copy.size - done, chunk - destination % chunk);
 			const auto source      = copy.srcOffset + done;
 			const bool resident    = buffer.IsResident(destination);
-			if (resident || !AllZero(data + (source - bias), length)) {
+			bool nonzero = resident;
+			if (!resident) {
+				scratch.resize(static_cast<size_t>(length));
+				ReadGuestForUpload(scratch.data(), buffer.CpuAddress() + destination, length);
+				nonzero = !AllZero(scratch.data(), length);
+			}
+			if (nonzero) {
 				if (!kept.empty() && kept.back().srcOffset + kept.back().size == source &&
 				    kept.back().dstOffset + kept.back().size == destination) {
 					kept.back().size += length;
@@ -140,6 +149,25 @@ void BufferCache::FilterSparseCopies(Buffer& buffer, const uint8_t* data, uint64
 	}
 	buffer.MakeResidentRanges(bind);
 	copies.swap(kept);
+}
+
+// MakeResident, naming the path and the shader whose binding backs 256 MB or more of a sparse
+// buffer at once: such a write binding undoes what the sparse buffer saves.
+static void MakeResidentNamed(Buffer& buffer, uint64_t offset, uint64_t size, const char* why) {
+	if (!buffer.IsSparse()) {
+		return;
+	}
+	if (const auto bytes = buffer.UnboundBytes(offset, size); bytes >= (256ull << 20u)) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1) < 16) {
+			std::printf("BufferCache: %s backs %" PRIu64 " MB of the sparse buffer at 0x%010" PRIx64
+			            " at once (range 0x%010" PRIx64 "+%" PRIu64 " MB, shader 0x%016" PRIx64 ")\n",
+			            why, bytes >> 20u, buffer.CpuAddress(), buffer.CpuAddress() + offset,
+			            size >> 20u, BufferCache::s_diag_shader_hash);
+			std::fflush(stdout);
+		}
+	}
+	buffer.MakeResident(offset, size);
 }
 
 void BufferCache::MakeSparseBuffersResident() {
@@ -558,6 +586,7 @@ static bool ReadbackRetick() {
 
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
                                      bool from_gpu_thread, bool async) {
+	KYTY_PROFILER_FUNCTION();
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return 0;
 	}
@@ -806,7 +835,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
-	new_buffer.MakeResident(overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	MakeResidentNamed(new_buffer, overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size(),
+	                  "a buffer merge");
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
@@ -1036,7 +1066,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::vector<vk::BufferCopy>
 		}
 		m_staging_buffer.Commit();
 		if (buffer.IsSparse()) {
-			FilterSparseCopies(buffer, mapped, base_offset, copies);
+			FilterSparseCopies(buffer, copies);
 			if (copies.empty()) {
 				return nullptr;
 			}
@@ -1053,7 +1083,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::vector<vk::BufferCopy>
 	}
 	temporary->Flush(0, total_size);
 	if (buffer.IsSparse()) {
-		FilterSparseCopies(buffer, temporary->Mapped().data(), 0, copies);
+		FilterSparseCopies(buffer, copies);
 	}
 	const auto handle = copies.empty() ? vk::Buffer {} : temporary->Handle();
 	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
@@ -1089,7 +1119,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
 	if (is_written) {
-		buffer.MakeResident(buffer.Offset(vaddr), size);
+		MakeResidentNamed(buffer, buffer.Offset(vaddr), size, "a written binding");
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
@@ -1116,7 +1146,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	// stores can reach become GPU-written.
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 	if (written_size != 0) {
-		buffer.MakeResident(buffer.Offset(written_vaddr), written_size);
+		MakeResidentNamed(buffer, buffer.Offset(written_vaddr), written_size,
+		                  "a bounded written binding");
 		(void)SynchronizeBuffer(buffer, written_vaddr, written_size, true, false);
 		MarkGpuWritten(written_vaddr, written_size);
 	}
@@ -1174,7 +1205,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
-	buffer.MakeResident(buffer.Offset(vaddr), size);
+	MakeResidentNamed(buffer, buffer.Offset(vaddr), size, "a tracked written binding");
 	(void)SynchronizeBuffer(buffer, vaddr, size, true, false);
 	MarkGpuWritten(vaddr, size, true);
 	return {&buffer, buffer.Offset(vaddr)};

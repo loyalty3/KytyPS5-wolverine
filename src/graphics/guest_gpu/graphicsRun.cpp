@@ -291,6 +291,8 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		// Requests from the game's threads served between packets (readbacks, unmaps).
+		KYTY_PROFILER_BLOCK("GuestGpu::ProcessCommands (game thread requests)");
 		command();
 	}
 }
