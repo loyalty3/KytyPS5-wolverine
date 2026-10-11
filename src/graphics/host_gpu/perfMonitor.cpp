@@ -155,7 +155,7 @@ void Initialize(GraphicContext* graphics) {
 	// The draw, dispatch, wait and readback counters (Profiler::Add) count only while this is on.
 	Profiler::g_counters = true;
 	g_window_start       = Clock::now();
-	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 9), a report every %.0f s\n", KYTY_BUILD_LABEL,
+	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 10), a report every %.0f s\n", KYTY_BUILD_LABEL,
 	            kReportSeconds);
 	std::fflush(stdout);
 }
@@ -402,8 +402,10 @@ void Tick() {
 			std::printf("Perf large buffers:");
 			for (size_t i = 0; i < g_buf_snapshot.large_count; i++) {
 				const auto [address, size] = g_buf_snapshot.large[i];
-				std::printf(" %" PRIu64 " MB at 0x%010" PRIx64 ", %" PRIu64 " MB of video memory", size >> 20u,
-				            address, g_buf_snapshot.large_resident[i] >> 20u);
+				std::printf(" %" PRIu64 " MB at 0x%010" PRIx64 ", %" PRIu64 " MB of video memory, %" PRIu64
+				            " MB of system memory",
+				            size >> 20u, address, g_buf_snapshot.large_resident[i] >> 20u,
+				            g_buf_snapshot.large_host[i] >> 20u);
 				for (size_t j = 0; j < g_scan_count; j++) {
 					if (g_scan[j].address == address && g_scan[j].size == size) {
 						std::printf(" (non-zero guest data %" PRIu64 " MB)", g_scan[j].nonzero >> 20u);

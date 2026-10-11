@@ -161,7 +161,16 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseTag,
 	m_chunk_size       = Common::AlignUp(std::max<uint64_t>(chunk_min, requirements.alignment),
 	                                     requirements.alignment);
 	m_memory_type_bits = requirements.memoryTypeBits;
-	m_chunks.assign(static_cast<size_t>((size + m_chunk_size - 1) / m_chunk_size), 0);
+	m_chunks.assign(static_cast<size_t>((size + m_chunk_size - 1) / m_chunk_size), ChunkUnbound);
+	// The memory types outside the card's own memory this buffer takes: cold chunks go there.
+	const auto& memory_properties = graphics.GetPhysicalDeviceMemoryProperties();
+	for (uint32_t type = 0; type < memory_properties.memoryTypeCount; type++) {
+		const bool device_local = static_cast<bool>(memory_properties.memoryTypes[type].propertyFlags &
+		                                            vk::MemoryPropertyFlagBits::eDeviceLocal);
+		if (!device_local && (m_memory_type_bits & (1u << type)) != 0) {
+			m_host_type_bits |= 1u << type;
+		}
+	}
 	if (static_cast<bool>(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
 		// The address of the whole range, bound or not: unbound pages read as zero.
 		vk::BufferDeviceAddressInfo address_info {};
@@ -183,6 +192,9 @@ Buffer::~Buffer() {
 		for (const auto& slab: m_slabs) {
 			vmaFreeMemory(m_graphics->allocator, slab.allocation);
 		}
+		for (const auto& slab: m_host_slabs) {
+			vmaFreeMemory(m_graphics->allocator, slab.allocation);
+		}
 		return;
 	}
 	if (m_buffer != nullptr) {
@@ -194,92 +206,68 @@ uint64_t Buffer::ResidentBytes() const noexcept {
 	return m_sparse ? m_resident_bytes : m_size;
 }
 
-void Buffer::MakeResident(uint64_t offset, uint64_t size) {
-	const std::pair<uint64_t, uint64_t> range {offset, size};
-	MakeResidentRanges({&range, 1});
+uint64_t Buffer::HostResidentBytes() const noexcept {
+	return m_sparse ? m_host_bytes : 0;
 }
 
-void Buffer::MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
-	if (!m_sparse) {
-		return;
-	}
-	std::vector<uint64_t> missing;
-	for (const auto& [offset, size]: ranges) {
-		if (size == 0) {
-			continue;
-		}
-		EXIT_IF(offset > m_size || size > m_size - offset);
-		const auto first = offset / m_chunk_size;
-		const auto last  = (offset + size - 1) / m_chunk_size;
-		for (auto chunk = first; chunk <= last; ++chunk) {
-			if (m_chunks[chunk] == 0) {
-				missing.push_back(chunk);
-			}
-		}
-	}
-	if (missing.empty()) {
-		return;
-	}
-	std::sort(missing.begin(), missing.end());
-	missing.erase(std::unique(missing.begin(), missing.end()), missing.end());
-	KYTY_PROFILER_FUNCTION();
-	auto& graphics = *m_graphics;
-	// Newly bound memory holds garbage until it is zeroed, and submitted work may read these
-	// pages (as unmapped, expecting zero): let it finish first. The command buffer being
-	// recorded is left alone; it is submitted after the bind and the fill below.
-	if (const auto tick = Scheduler().CurrentTick(); tick > 1) {
-		Scheduler().Wait(tick - 1);
-	}
+void Buffer::MakeResident(uint64_t offset, uint64_t size, bool cold) {
+	const std::pair<uint64_t, uint64_t> range {offset, size};
+	MakeResidentRanges({&range, 1}, cold);
+}
 
-	std::vector<vk::SparseMemoryBind> binds;
-	binds.reserve(missing.size());
-	for (const auto chunk: missing) {
-		const auto start  = chunk * m_chunk_size;
-		const auto length = std::min(m_chunk_size, m_size - start);
-		if (m_slabs.empty() || m_slabs.back().used + m_chunk_size > m_slabs.back().size) {
-			constexpr uint64_t SlabBytes = 2ull << 20u;
-			const auto         slab_size = Common::AlignUp(std::max(SlabBytes, m_chunk_size), m_chunk_size);
-			VkMemoryRequirements requirements {};
-			requirements.size           = slab_size;
-			requirements.alignment      = m_chunk_size;
-			requirements.memoryTypeBits = m_memory_type_bits;
-			VmaAllocationCreateInfo create {};
+// A chunk's worth of memory from the current slab of the kind asked for (video memory, or system
+// memory for cold chunks), a new 2 MB slab when it is full. Cold falls back to video memory when
+// the buffer takes no system-memory type.
+Buffer::ChunkMemory Buffer::AllocateChunk(bool cold) {
+	auto& graphics = *m_graphics;
+	if (cold && m_host_type_bits == 0) {
+		cold = false;
+	}
+	auto& slabs = cold ? m_host_slabs : m_slabs;
+	if (slabs.empty() || slabs.back().used + m_chunk_size > slabs.back().size) {
+		constexpr uint64_t SlabBytes = 2ull << 20u;
+		const auto slab_size = Common::AlignUp(std::max(SlabBytes, m_chunk_size), m_chunk_size);
+		VkMemoryRequirements requirements {};
+		requirements.size           = slab_size;
+		requirements.alignment      = m_chunk_size;
+		requirements.memoryTypeBits = cold ? m_host_type_bits : m_memory_type_bits;
+		VmaAllocationCreateInfo create {};
+		VmaAllocation           allocation = nullptr;
+		VmaAllocationInfo       info {};
+		VkResult                result     = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+		if (!cold) {
 			create.flags         = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
 			create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-			VmaAllocation     allocation = nullptr;
-			VmaAllocationInfo info {};
-			auto result =
-			    vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
+			result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
 			if (result != VK_SUCCESS) {
 				// Over budget: the card past its budget (the driver may page), as dense buffers do.
 				create.flags = 0;
 				result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
 			}
 			if (result != VK_SUCCESS) {
-				// Then any memory type the buffer takes.
 				create.requiredFlags  = 0;
 				create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-				result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
 			}
-			if (result != VK_SUCCESS) {
-				graphics.LogMemoryBudget();
-				EXIT("Out of memory: %" PRIu64 " KB of video memory for a sparse buffer (%s).\n",
-				     slab_size >> 10u, vk::to_string(static_cast<vk::Result>(result)).c_str());
-			}
-			m_slabs.push_back({allocation, info.deviceMemory, info.offset, slab_size, 0});
 		}
-		auto& slab = m_slabs.back();
-		vk::SparseMemoryBind bind {};
-		bind.resourceOffset = start;
-		bind.size           = length;
-		bind.memory         = slab.memory;
-		bind.memoryOffset   = slab.offset + slab.used;
-		slab.used += m_chunk_size;
-		binds.push_back(bind);
-		m_chunks[chunk] = 1;
-		m_resident_bytes += length;
+		if (result != VK_SUCCESS) {
+			result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
+		}
+		if (result != VK_SUCCESS) {
+			graphics.LogMemoryBudget();
+			EXIT("Out of memory: %" PRIu64 " KB of %s memory for a sparse buffer (%s).\n",
+			     slab_size >> 10u, cold ? "system" : "video",
+			     vk::to_string(static_cast<vk::Result>(result)).c_str());
+		}
+		slabs.push_back({allocation, info.deviceMemory, info.offset, slab_size, 0});
 	}
+	auto&             slab = slabs.back();
+	const ChunkMemory memory {slab.memory, slab.offset + slab.used, cold};
+	slab.used += m_chunk_size;
+	return memory;
+}
 
+void Buffer::BindAndWait(std::span<const vk::SparseMemoryBind> binds) {
+	auto&                          graphics = *m_graphics;
 	vk::SparseBufferMemoryBindInfo buffer_bind {};
 	buffer_bind.buffer    = m_buffer;
 	buffer_bind.bindCount = static_cast<uint32_t>(binds.size());
@@ -297,17 +285,20 @@ void Buffer::MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> r
 	}
 	RequireVulkanSuccess(graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX),
 	                     "wait for sparse bind");
-	RequireVulkanSuccess(graphics.device.resetFences(1, &fence), "reset sparse bind fence");
+	graphics.device.destroyFence(fence, nullptr);
+}
 
-	// Newly bound memory is undefined; unmapped entries must read zero, as unbound ones did.
-	// Zeroed in a command buffer of its own, done before the scheduler's next submission.
+// Records fn(command) in a command buffer of its own, submits it and waits for it.
+template <typename F>
+void Buffer::RunOneShot(F&& fn) {
+	auto& graphics = *m_graphics;
 	if (m_pool == nullptr) {
 		vk::CommandPoolCreateInfo pool_info {};
 		pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient |
 		                             vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
 		pool_info.queueFamilyIndex = graphics.queue_family;
 		RequireVulkanSuccess(graphics.device.createCommandPool(&pool_info, nullptr, &m_pool),
-		                     "create sparse fill pool");
+		                     "create sparse command pool");
 	}
 	vk::CommandBufferAllocateInfo allocate {};
 	allocate.commandPool        = m_pool;
@@ -315,141 +306,161 @@ void Buffer::MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> r
 	allocate.commandBufferCount = 1;
 	vk::CommandBuffer command {};
 	RequireVulkanSuccess(graphics.device.allocateCommandBuffers(&allocate, &command),
-	                     "allocate sparse fill command buffer");
+	                     "allocate sparse command buffer");
 	vk::CommandBufferBeginInfo begin {};
 	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-	RequireVulkanSuccess(command.begin(&begin), "begin sparse fill");
-	for (size_t i = 0; i < binds.size();) {
-		auto begin = binds[i].resourceOffset;
-		auto end   = begin + binds[i].size;
-		for (i++; i < binds.size() && binds[i].resourceOffset == end; i++) {
-			end += binds[i].size;
-		}
-		command.fillBuffer(m_buffer, begin, end - begin, 0);
-	}
+	RequireVulkanSuccess(command.begin(&begin), "begin sparse command buffer");
+	fn(command);
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr, 0,
 	                        nullptr);
-	RequireVulkanSuccess(command.end(), "end sparse fill");
+	RequireVulkanSuccess(command.end(), "end sparse command buffer");
+	vk::FenceCreateInfo fence_info {};
+	vk::Fence           fence {};
+	RequireVulkanSuccess(graphics.device.createFence(&fence_info, nullptr, &fence),
+	                     "create sparse fence");
 	vk::SubmitInfo submit {};
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &command;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		RequireVulkanSuccess(graphics.queue.submit(1, &submit, fence), "submit sparse fill");
+		RequireVulkanSuccess(graphics.queue.submit(1, &submit, fence), "submit sparse commands");
 	}
 	RequireVulkanSuccess(graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX),
-	                     "wait for sparse fill");
+	                     "wait for sparse commands");
 	graphics.device.freeCommandBuffers(m_pool, 1, &command);
 	graphics.device.destroyFence(fence, nullptr);
 }
 
-vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
-	EXIT_IF(m_device_address == 0);
-	return m_device_address;
-}
-
-bool Buffer::IsInBounds(uint64_t address, uint64_t size) const noexcept {
-	return address >= m_cpu_address && size <= Size() && address - m_cpu_address <= Size() - size;
-}
-
-void Buffer::Flush(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
-	if (!IsCoherent() && size != 0) {
-		const auto result =
-		    vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
-		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
+void Buffer::WaitSubmitted() {
+	// Submitted work may read or write the chunks about to change; the command buffer being
+	// recorded is left alone (it is submitted after).
+	if (const auto tick = Scheduler().CurrentTick(); tick > 1) {
+		Scheduler().Wait(tick - 1);
 	}
 }
 
-void Buffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
-	if (!IsCoherent() && size != 0) {
-		const auto result =
-		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
-		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
+void Buffer::MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges, bool cold) {
+	if (!m_sparse) {
+		return;
 	}
+	std::vector<uint64_t> missing;
+	for (const auto& [offset, size]: ranges) {
+		if (size == 0) {
+			continue;
+		}
+		EXIT_IF(offset > m_size || size > m_size - offset);
+		const auto first = offset / m_chunk_size;
+		const auto last  = (offset + size - 1) / m_chunk_size;
+		for (auto chunk = first; chunk <= last; ++chunk) {
+			if (m_chunks[chunk] == ChunkUnbound) {
+				missing.push_back(chunk);
+			}
+		}
+	}
+	if (missing.empty()) {
+		return;
+	}
+	std::sort(missing.begin(), missing.end());
+	missing.erase(std::unique(missing.begin(), missing.end()), missing.end());
+	KYTY_PROFILER_FUNCTION();
+	// Newly bound memory holds garbage until it is zeroed, and submitted work may read these
+	// pages (as unmapped, expecting zero): let it finish first.
+	WaitSubmitted();
+
+	std::vector<vk::SparseMemoryBind> binds;
+	binds.reserve(missing.size());
+	for (const auto chunk: missing) {
+		const auto start  = chunk * m_chunk_size;
+		const auto length = std::min(m_chunk_size, m_size - start);
+		const auto memory = AllocateChunk(cold);
+		vk::SparseMemoryBind bind {};
+		bind.resourceOffset = start;
+		bind.size           = length;
+		bind.memory         = memory.memory;
+		bind.memoryOffset   = memory.offset;
+		binds.push_back(bind);
+		m_chunks[chunk] = memory.host ? ChunkHost : ChunkDevice;
+		(memory.host ? m_host_bytes : m_resident_bytes) += length;
+	}
+	BindAndWait(binds);
+
+	// Newly bound memory is undefined; unmapped entries must read zero, as unbound ones did.
+	RunOneShot([&](vk::CommandBuffer command) {
+		for (size_t i = 0; i < binds.size();) {
+			auto begin = binds[i].resourceOffset;
+			auto end   = begin + binds[i].size;
+			for (i++; i < binds.size() && binds[i].resourceOffset == end; i++) {
+				end += binds[i].size;
+			}
+			command.fillBuffer(m_buffer, begin, end - begin, 0);
+		}
+	});
 }
 
-vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::AccessFlags source,
-                                        vk::AccessFlags destination) const {
-	if (Handle() == nullptr || size == 0 || offset > Size() || size > Size() - offset) {
-		EXIT("Buffer: invalid DMA barrier, handle=%p offset=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " capacity=0x%016" PRIx64 "\n",
-		     static_cast<const void*>(Handle()), offset, size, Size());
+// Chunks in system memory that are getting data the scene draws (non-zero uploads) move to video
+// memory: their bytes are copied into a chunk of video memory through a buffer of its own, then
+// that memory takes the range's place in the sparse buffer.
+void Buffer::PromoteChunks(std::span<const uint64_t> chunks) {
+	if (!m_sparse || chunks.empty()) {
+		return;
 	}
-	vk::BufferMemoryBarrier barrier {};
-	barrier.srcAccessMask       = source;
-	barrier.dstAccessMask       = destination;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = Handle();
-	barrier.offset              = offset;
-	barrier.size                = size;
-	return barrier;
-}
-
-void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
-                      uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
-                      vk::AccessFlags destination_before, vk::AccessFlags source_after,
-                      vk::AccessFlags destination_after) {
-	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
-	    destination_offset > Size() || size > Size() - destination_offset) {
-		EXIT("Buffer: invalid copy range\n");
-	}
-	if (source.Handle() == Handle() && source_offset < destination_offset + size &&
-	    destination_offset < source_offset + size) {
-		EXIT("Buffer: overlapping self-copy\n");
-	}
-	command.EndRendering();
-	const vk::BufferMemoryBarrier before[] = {
-	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),
-	    Barrier(destination_offset, size, destination_before, vk::AccessFlagBits::eTransferWrite),
+	KYTY_PROFILER_FUNCTION();
+	auto& graphics = *m_graphics;
+	WaitSubmitted();
+	struct Move {
+		uint64_t    chunk;
+		uint64_t    length;
+		ChunkMemory memory;
+		vk::Buffer  staging;
 	};
-	const auto host_access  = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite;
-	auto       before_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
-	if (static_cast<bool>((source_before | destination_before) & host_access)) {
-		before_stage |= vk::PipelineStageFlagBits::eHost;
+	std::vector<Move> moves;
+	for (const auto chunk: chunks) {
+		if (m_chunks[chunk] != ChunkHost) {
+			continue;
+		}
+		const auto           start  = chunk * m_chunk_size;
+		const auto           length = std::min(m_chunk_size, m_size - start);
+		const auto           memory = AllocateChunk(false);
+		vk::BufferCreateInfo info {};
+		info.size        = length;
+		info.usage       = vk::BufferUsageFlagBits::eTransferDst;
+		info.sharingMode = vk::SharingMode::eExclusive;
+		vk::Buffer staging {};
+		RequireVulkanSuccess(graphics.device.createBuffer(&info, nullptr, &staging),
+		                     "create sparse promotion buffer");
+		RequireVulkanSuccess(graphics.device.bindBufferMemory(staging, memory.memory, memory.offset),
+		                     "bind sparse promotion buffer");
+		moves.push_back({chunk, length, memory, staging});
 	}
-	const auto native = command.Recorder();
-	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
-	const vk::BufferCopy copy {source_offset, destination_offset, size};
-	native.copyBuffer(source.Handle(), Handle(), 1, &copy);
-	const vk::BufferMemoryBarrier after[] = {
-	    source.Barrier(source_offset, size, vk::AccessFlagBits::eTransferRead, source_after),
-	    Barrier(destination_offset, size, vk::AccessFlagBits::eTransferWrite, destination_after),
-	};
-	auto after_stage = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllCommands};
-	if (static_cast<bool>((source_after | destination_after) & host_access)) {
-		after_stage |= vk::PipelineStageFlagBits::eHost;
+	if (moves.empty()) {
+		return;
 	}
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, after_stage,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
-}
-
-void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
-	if (((offset | size) & 3u) != 0) {
-		EXIT("Buffer: fill range must be dword aligned\n");
+	RunOneShot([&](vk::CommandBuffer command) {
+		for (const auto& move: moves) {
+			const vk::BufferCopy copy {move.chunk * m_chunk_size, 0, move.length};
+			command.copyBuffer(m_buffer, move.staging, 1, &copy);
+		}
+	});
+	std::vector<vk::SparseMemoryBind> binds;
+	for (const auto& move: moves) {
+		vk::SparseMemoryBind bind {};
+		bind.resourceOffset = move.chunk * m_chunk_size;
+		bind.size           = move.length;
+		bind.memory         = move.memory.memory;
+		bind.memoryOffset   = move.memory.offset;
+		binds.push_back(bind);
+		m_chunks[move.chunk] = ChunkDevice;
+		m_host_bytes -= move.length;
+		m_resident_bytes += move.length;
 	}
-	auto& command = Scheduler().Current();
-	command.EndRendering();
-	const auto before =
-	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-	            vk::AccessFlagBits::eTransferWrite);
-	const auto native = command.Recorder();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-	                       0, nullptr, 1, &before, 0, nullptr);
-	native.fillBuffer(Handle(), offset, size, value);
-	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite,
-	                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	BindAndWait(binds);
+	for (const auto& move: moves) {
+		graphics.device.destroyBuffer(move.staging, nullptr);
+	}
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,

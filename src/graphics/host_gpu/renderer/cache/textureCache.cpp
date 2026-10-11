@@ -2411,6 +2411,25 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool pressured  = CollectableMemory() >= m_pressure_gc_memory;
 		bool aggressive = allow_aggressive && CollectableMemory() >= m_critical_gc_memory;
+		// The collector runs once per guest submission, ~100 times a frame. Under pressure a pass
+		// that freed nothing (every candidate a heap texture still sampled, a small target, a
+		// depth association) walked up to 4096 of them again on every submission after: 2-6 % of
+		// the GPU thread (2026-10-11). Until the next frame, nothing has aged into a candidate.
+		if ((pressured || aggressive) && m_gc_fruitless_frame == clock) {
+			return;
+		}
+		const auto freed_before = m_gc_freed_images_frame;
+		struct FruitlessCheck {
+			TextureCache& cache;
+			bool          active;
+			uint64_t      before;
+			uint64_t      clock;
+			~FruitlessCheck() {
+				if (active && cache.m_gc_freed_images_frame == before) {
+					cache.m_gc_fruitless_frame = clock;
+				}
+			}
+		} fruitless_check {*this, pressured || aggressive, freed_before, clock};
 		// Ages in frames. This collector runs once per guest submission, and a title can
 		// submit a hundred times a frame: an age counted in its ticks evicted textures inside
 		// the frame that used them, to recreate them the next (11 000 images a second at the

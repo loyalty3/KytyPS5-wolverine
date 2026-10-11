@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/perfMonitor.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 
 #include "common/logging/log.h"
@@ -5,6 +6,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "kernel/memory.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -287,6 +289,19 @@ void LogCountersIfDue() {
 		previous[i]      = value;
 	}
 	const auto c = [&](Counter counter) { return static_cast<unsigned long long>(delta[static_cast<size_t>(counter)]); };
+	if (PerfMonitor::Enabled()) {
+		// KYTY_PERF: how often the GPU thread took a walk the scanner prepared, and why not.
+		std::printf("Perf drawprep (10 s): scanned %llu, prepared %llu; GPU took %llu: used %llu, "
+		            "missed: none %llu / other program %llu / inputs %llu / bytes changed %llu; "
+		            "scanner skipped: behind %llu / unknown pair %llu / unsupported %llu / not "
+		            "translated %llu, walk failed %llu, tainted %llu\n",
+		            c(Counter::Scanned), c(Counter::Prepared), c(Counter::Takes),
+		            c(Counter::Used) + c(Counter::Reused), c(Counter::MissNone),
+		            c(Counter::MissEntry), c(Counter::MissInputs), c(Counter::MissReads),
+		            c(Counter::SkipBehind), c(Counter::SkipUnknownPair), c(Counter::SkipUnsupported),
+		            c(Counter::SkipNoEntry), c(Counter::FailWalk), c(Counter::Tainted));
+		std::fflush(stdout);
+	}
 	LOGF("DrawPrep (10 s): scanned %llu, prepared %llu stages, skipped behind %llu / unknown pair "
 	     "%llu / unsupported %llu / no entry %llu, walk failed %llu, tainted %llu (indirect %llu, "
 	     "context %llu); GPU takes %llu, "

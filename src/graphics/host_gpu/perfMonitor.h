@@ -71,6 +71,7 @@ struct BufferSnapshot {
 	std::array<std::pair<uint64_t, uint64_t>, MaxLarge> large {}; // guest address, size
 	size_t                                               large_count = 0;
 	std::array<uint64_t, MaxLarge>                       large_resident {}; // video memory backing it
+	std::array<uint64_t, MaxLarge>                       large_host {}; // system memory backing it
 	uint64_t sparse_skipped_bytes = 0; // all-zero upload bytes left unbacked since the last report
 };
 

@@ -56,9 +56,20 @@ public:
 	// Binding waits for submitted work first (it may read these pages expecting zero) and
 	// zeroes in a command buffer of its own; the one being recorded is not split.
 	// GPU thread only. Memory stays bound until the buffer is destroyed.
-	void MakeResident(uint64_t offset, uint64_t size);
+	// cold: the range is backed only to be safe (a write binding over memory the scene has not
+	// filled); its chunks go to system memory where the buffer takes it, and move to video memory
+	// when data arrives (PromoteChunks).
+	void MakeResident(uint64_t offset, uint64_t size, bool cold = false);
 	// The same for several ranges (offset, size) at once: one wait, one bind.
-	void MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+	void MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges, bool cold = false);
+	// Chunks in system memory (ChunkState ChunkHost) move to video memory, contents kept.
+	void PromoteChunks(std::span<const uint64_t> chunks);
+	static constexpr uint8_t ChunkUnbound = 0;
+	static constexpr uint8_t ChunkDevice  = 1;
+	static constexpr uint8_t ChunkHost    = 2;
+	[[nodiscard]] uint8_t ChunkState(uint64_t offset) const noexcept {
+		return m_sparse ? m_chunks[offset / m_chunk_size] : ChunkDevice;
+	}
 	// Sparse: whether the chunk holding this offset is bound (dense: always).
 	[[nodiscard]] bool     IsResident(uint64_t offset) const noexcept {
 		return !m_sparse || m_chunks[offset / m_chunk_size] != 0;
@@ -77,7 +88,8 @@ public:
 		return bytes;
 	}
 	// Bytes bound so far (sparse), or the whole size (dense).
-	[[nodiscard]] uint64_t ResidentBytes() const noexcept;
+	[[nodiscard]] uint64_t ResidentBytes() const noexcept; // in video memory
+	[[nodiscard]] uint64_t HostResidentBytes() const noexcept; // sparse chunks in system memory
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
@@ -136,7 +148,7 @@ private:
 	bool                          m_sparse          = false;
 	uint64_t                      m_chunk_size      = 0;
 	uint32_t                      m_memory_type_bits = 0;
-	std::vector<uint8_t>          m_chunks; // 1 where bound
+	std::vector<uint8_t>          m_chunks; // ChunkUnbound, ChunkDevice or ChunkHost
 	// Memory comes from 2 MB slabs, cut into chunks: one VMA allocation per 64 KB chunk made
 	// 21,000 of them for the geometry pool, and past the budget VMA served each from a memory
 	// object of its own (5,067 objects, 2026-10-11).
@@ -147,7 +159,20 @@ private:
 		uint64_t        size       = 0;
 		uint64_t        used       = 0;
 	};
-	std::vector<Slab>             m_slabs;
+	std::vector<Slab>             m_slabs;      // video memory
+	std::vector<Slab>             m_host_slabs; // system memory (cold chunks)
+	uint32_t                      m_host_type_bits = 0;
+	uint64_t                      m_host_bytes     = 0;
+	struct ChunkMemory {
+		vk::DeviceMemory memory = nullptr;
+		uint64_t         offset = 0;
+		bool             host   = false;
+	};
+	ChunkMemory AllocateChunk(bool cold);
+	void        BindAndWait(std::span<const vk::SparseMemoryBind> binds);
+	template <typename F>
+	void RunOneShot(F&& fn);
+	void WaitSubmitted();
 	uint64_t                      m_resident_bytes  = 0;
 	vk::CommandPool               m_pool            = nullptr;
 };

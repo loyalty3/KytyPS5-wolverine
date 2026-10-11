@@ -237,6 +237,8 @@ private:
 	uint64_t                                          m_guest_dropped_freed_bytes = 0;
 	// Why the image being deleted goes (KYTY_PERF); anything not set is a replacement.
 	PerfMonitor::TextureEvent                         m_free_reason = PerfMonitor::TextureEvent::FreedReplaced;
+	// The frame in which a collector pass under pressure freed nothing (RunGarbageCollector).
+	uint64_t                                          m_gc_fruitless_frame = UINT64_MAX;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	// Evictions are budgeted per frame, not per collector run: see RunGarbageCollector.

@@ -117,6 +117,7 @@ void BufferCache::FilterSparseCopies(Buffer& buffer, std::vector<vk::BufferCopy>
 	const auto chunk = buffer.ChunkSize();
 	std::vector<vk::BufferCopy>                 kept;
 	std::vector<std::pair<uint64_t, uint64_t>> bind;
+	std::vector<uint64_t>                      promote; // system-memory chunks getting data
 	kept.reserve(copies.size());
 	for (const auto& copy: copies) {
 		uint64_t done = 0;
@@ -124,12 +125,19 @@ void BufferCache::FilterSparseCopies(Buffer& buffer, std::vector<vk::BufferCopy>
 			const auto destination = copy.dstOffset + done;
 			const auto length      = std::min(copy.size - done, chunk - destination % chunk);
 			const auto source      = copy.srcOffset + done;
-			const bool resident    = buffer.IsResident(destination);
-			bool nonzero = resident;
-			if (!resident) {
+			const auto state       = buffer.ChunkState(destination);
+			const bool resident    = state != Buffer::ChunkUnbound;
+			bool nonzero = state == Buffer::ChunkDevice;
+			if (state != Buffer::ChunkDevice) {
 				scratch.resize(static_cast<size_t>(length));
 				ReadGuestForUpload(scratch.data(), buffer.CpuAddress() + destination, length);
 				nonzero = !AllZero(scratch.data(), length);
+			}
+			if (state == Buffer::ChunkHost && nonzero) {
+				promote.push_back(destination / chunk);
+			}
+			if (state == Buffer::ChunkHost && !nonzero) {
+				nonzero = true; // backed already: the zeros are copied as they are
 			}
 			if (nonzero) {
 				if (!kept.empty() && kept.back().srcOffset + kept.back().size == source &&
@@ -148,26 +156,39 @@ void BufferCache::FilterSparseCopies(Buffer& buffer, std::vector<vk::BufferCopy>
 		}
 	}
 	buffer.MakeResidentRanges(bind);
+	if (!promote.empty()) {
+		std::sort(promote.begin(), promote.end());
+		promote.erase(std::unique(promote.begin(), promote.end()), promote.end());
+		buffer.PromoteChunks(promote);
+	}
 	copies.swap(kept);
 }
 
 // MakeResident, naming the path and the shader whose binding backs 256 MB or more of a sparse
 // buffer at once: such a write binding undoes what the sparse buffer saves.
-static void MakeResidentNamed(Buffer& buffer, uint64_t offset, uint64_t size, const char* why) {
+// cold_ok: a write binding; past 64 MB of unbacked range at once its chunks go to system memory
+// (shader 0x2ea3957af2daf690 binds Wolverine's whole 2.7 GB geometry pool for writing, which backed
+// 1.5 GB of zeros in video memory and pushed the card past its budget, 2026-10-11). Chunks the
+// scene then fills move to video memory (FilterSparseCopies).
+static void MakeResidentNamed(Buffer& buffer, uint64_t offset, uint64_t size, const char* why,
+                              bool cold_ok = false) {
 	if (!buffer.IsSparse()) {
 		return;
 	}
-	if (const auto bytes = buffer.UnboundBytes(offset, size); bytes >= (256ull << 20u)) {
+	const auto unbound = buffer.UnboundBytes(offset, size);
+	const bool cold    = cold_ok && unbound >= (64ull << 20u);
+	if (const auto bytes = unbound; bytes >= (256ull << 20u)) {
 		static std::atomic<uint32_t> reported {0};
 		if (reported.fetch_add(1) < 16) {
 			std::printf("BufferCache: %s backs %" PRIu64 " MB of the sparse buffer at 0x%010" PRIx64
-			            " at once (range 0x%010" PRIx64 "+%" PRIu64 " MB, shader 0x%016" PRIx64 ")\n",
+			            " at once (range 0x%010" PRIx64 "+%" PRIu64 " MB, shader 0x%016" PRIx64
+			            ") in %s memory\n",
 			            why, bytes >> 20u, buffer.CpuAddress(), buffer.CpuAddress() + offset,
-			            size >> 20u, BufferCache::s_diag_shader_hash);
+			            size >> 20u, BufferCache::s_diag_shader_hash, cold ? "system" : "video");
 			std::fflush(stdout);
 		}
 	}
-	buffer.MakeResident(offset, size);
+	buffer.MakeResident(offset, size, cold);
 }
 
 void BufferCache::MakeSparseBuffersResident() {
@@ -282,6 +303,7 @@ void BufferCache::ReleaseBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	// One reservation cannot exceed the download ring, so a larger range goes in ring-sized
 	// windows; a window that does not fit drains the ring before it is mapped.
 	const auto capacity = m_download_buffer.Size();
@@ -294,6 +316,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 template <bool async>
 bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -342,6 +365,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 template <bool async>
 void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
                                        uint64_t total_size) {
+	KYTY_PROFILER_FUNCTION();
 	Profiler::Add(Profiler::Counter::Readbacks);
 	Profiler::Add(Profiler::Counter::ReadbackBytes, static_cast<int64_t>(total_size));
 	const auto buffer_address = buffer.CpuAddress();
@@ -595,6 +619,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	// Diagnostics: whether the bytes the faulting access touches were written by the GPU
 	// (true sharing) or only share the page with bytes that were (false sharing).
 	{
+		KYTY_PROFILER_BLOCK("ReadMemoryStep::Diagnostics");
 		static uint64_t exact = 0;
 		static uint64_t shared = 0;
 		const bool      dirty  = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
@@ -654,6 +679,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			m_scheduler.WaitPriorityOperations(m_last_async_download_tick);
 		}
 		if (async && ReadbackWindow() != 0) {
+			KYTY_PROFILER_BLOCK("ReadMemoryStep::LiftWindow");
 			// The whole download window, as the synchronous path lifts it: page by page, each
 			// page of the window faulted on its own and went through the GPU thread again.
 			const auto window = ReadbackWindow();
@@ -686,9 +712,12 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 				first = last;
 			}
 		}
-		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		{
+			KYTY_PROFILER_BLOCK("ReadMemoryStep::LiftPages");
+			m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
 		}
 		static uint64_t lifted = 0;
 		if (++lifted % 1024 == 1) {
@@ -1119,7 +1148,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
 	if (is_written) {
-		MakeResidentNamed(buffer, buffer.Offset(vaddr), size, "a written binding");
+		MakeResidentNamed(buffer, buffer.Offset(vaddr), size, "a written binding", true);
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
@@ -1205,7 +1234,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
-	MakeResidentNamed(buffer, buffer.Offset(vaddr), size, "a tracked written binding");
+	MakeResidentNamed(buffer, buffer.Offset(vaddr), size, "a tracked written binding", true);
 	(void)SynchronizeBuffer(buffer, vaddr, size, true, false);
 	MarkGpuWritten(vaddr, size, true);
 	return {&buffer, buffer.Offset(vaddr)};
@@ -1213,6 +1242,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 
 bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size,
                                         bool async, uint64_t& wait_tick) {
+	KYTY_PROFILER_FUNCTION();
 	if (m_write_bitmap == nullptr) {
 		return false;
 	}
@@ -1581,6 +1611,7 @@ void BufferCache::RunGarbageCollector() {
 			const auto* owner = m_page_table.Find(large[i].second >> PageTable::kPageBits);
 			if (owner != nullptr && *owner) {
 				snapshot.large_resident[i] = m_slot_buffers[*owner].ResidentBytes();
+				snapshot.large_host[i]     = m_slot_buffers[*owner].HostResidentBytes();
 			}
 		}
 		snapshot.sparse_skipped_bytes = std::exchange(m_sparse_skipped_bytes, 0);
