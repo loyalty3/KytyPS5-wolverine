@@ -185,6 +185,10 @@ struct PerfZoneStats {
 	int64_t                          self_ns  = 0;
 	int64_t                          total_ns = 0;
 	int64_t                          calls    = 0;
+	// Time this zone spent waiting for the GPU (a MasterSemaphore::Wait beneath it, through
+	// wait wrappers only): which work makes the GPU thread stop and wait.
+	int64_t                          gpu_wait_ns    = 0;
+	int64_t                          gpu_wait_calls = 0;
 };
 // The GPU thread's table (open addressing on the location pointer). Read and reset on that
 // thread only (PerfMonitor::Tick).

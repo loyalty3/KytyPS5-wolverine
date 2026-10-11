@@ -6,6 +6,7 @@
 #include <common/TracyVersion.hpp>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -218,22 +219,50 @@ int64_t PerfZoneNow() {
 	    .count();
 }
 
+static PerfZoneStats* FindSlot(const tracy::SourceLocationData* location) {
+	auto*      table = PerfZoneTable();
+	const auto hash  = (reinterpret_cast<uintptr_t>(location) >> 4u) * 0x9E3779B97F4A7C15ull;
+	for (size_t probe = 0; probe < kPerfZoneSlots; probe++) {
+		auto& slot = table[(hash + probe) & (kPerfZoneSlots - 1)];
+		if (slot.location == location || slot.location == nullptr) {
+			slot.location = location;
+			return &slot;
+		}
+	}
+	return nullptr;
+}
+
+static const char* PerfZoneLabel(const tracy::SourceLocationData* location) {
+	return location->name != nullptr ? location->name : location->function;
+}
+
 void PerfZone::Finish() {
 	const auto elapsed = PerfZoneNow() - m_start;
 	s_top              = m_parent;
 	if (m_parent != nullptr) {
 		m_parent->m_child_ns += elapsed;
 	}
-	auto*      table = PerfZoneTable();
-	const auto hash  = (reinterpret_cast<uintptr_t>(m_location) >> 4u) * 0x9E3779B97F4A7C15ull;
-	for (size_t probe = 0; probe < kPerfZoneSlots; probe++) {
-		auto& slot = table[(hash + probe) & (kPerfZoneSlots - 1)];
-		if (slot.location == m_location || slot.location == nullptr) {
-			slot.location = m_location;
-			slot.self_ns += elapsed - m_child_ns;
-			slot.total_ns += elapsed;
-			slot.calls++;
-			return;
+	if (auto* slot = FindSlot(m_location); slot != nullptr) {
+		slot->self_ns += elapsed - m_child_ns;
+		slot->total_ns += elapsed;
+		slot->calls++;
+	}
+	const char* name = PerfZoneLabel(m_location);
+	if (name != nullptr && std::strncmp(name, "MasterSemaphore::Wait", 21) == 0) {
+		// Charged to the nearest enclosing zone that is not itself a wait.
+		auto* owner = m_parent;
+		while (owner != nullptr) {
+			const char* owner_name = PerfZoneLabel(owner->m_location);
+			if (owner_name == nullptr || std::strstr(owner_name, "Wait") == nullptr) {
+				break;
+			}
+			owner = owner->m_parent;
+		}
+		if (owner != nullptr) {
+			if (auto* slot = FindSlot(owner->m_location); slot != nullptr) {
+				slot->gpu_wait_ns += elapsed;
+				slot->gpu_wait_calls++;
+			}
 		}
 	}
 }

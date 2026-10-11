@@ -36,6 +36,7 @@
 #include <unordered_set>
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -1763,11 +1764,25 @@ void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_
 	}
 	constexpr uint64_t ProbeFrames   = 16; // frames a texture must go unsampled
 	constexpr uint64_t ProbeInterval = 32; // frames between the end of one probe and the next
+	// The probe counted frames only: when memory ran out and the frame rate fell to 1-2 fps, a
+	// probe and the wait before the next took 30-50 s, and the card stayed over its budget
+	// (textures 4.7-5.9 GB, nearly all heap-pinned; 0.1-2 fps for minutes, 2026-10-11). Each
+	// step now also ends after a time (still at least MinProbeFrames frames unsampled).
+	constexpr uint64_t MinProbeFrames  = 4;
+	constexpr auto     ProbeTime       = std::chrono::milliseconds(750);
+	constexpr auto     IntervalTime    = std::chrono::milliseconds(1500);
+	static std::chrono::steady_clock::time_point probe_started {};
+	static std::chrono::steady_clock::time_point probe_ended {};
+	const auto         now           = std::chrono::steady_clock::now();
 	auto&              table         = m_context.GetBindlessTable();
 	auto&              texture_cache = m_context.GetTextureCache();
 	if (m_bindless_probe_frame != 0) {
-		// The snapshot read here must have been recorded ProbeFrames after the marks.
-		if (snapshot_frame < m_bindless_probe_frame + ProbeFrames) {
+		// The snapshot read here must have been recorded ProbeFrames after the marks (or
+		// MinProbeFrames, once ProbeTime has passed).
+		const bool frames_done = snapshot_frame >= m_bindless_probe_frame + ProbeFrames;
+		const bool time_done   = snapshot_frame >= m_bindless_probe_frame + MinProbeFrames &&
+		                       now - probe_started >= ProbeTime;
+		if (!frames_done && !time_done) {
 			return;
 		}
 		m_bindless_unused.clear();
@@ -1775,6 +1790,7 @@ void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_
 		texture_cache.SetBindlessEvictable(m_bindless_unused);
 		m_bindless_probe_frame = 0;
 		m_bindless_next_probe  = frame + ProbeInterval;
+		probe_ended            = now;
 		static std::atomic<uint32_t> logged = 0;
 		if (logged.fetch_add(1) < 32) {
 			uint64_t bytes = 0;
@@ -1792,9 +1808,11 @@ void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_
 	// them), so the probe evicts them only when the device itself is short of memory (4-8 GB
 	// cards), not at the texture cache's bound: under a 6 GiB bound it evicted 27,915 of them in
 	// 14 minutes, each settled again when drawn.
-	if (frame >= m_bindless_next_probe && m_context.GetGraphics().DeviceMemoryAtLeast(90)) {
+	const bool interval_done = frame >= m_bindless_next_probe || now - probe_ended >= IntervalTime;
+	if (interval_done && m_context.GetGraphics().DeviceMemoryAtLeast(90)) {
 		table.ArmUsageProbe();
 		m_bindless_probe_frame = frame;
+		probe_started          = now;
 	}
 }
 

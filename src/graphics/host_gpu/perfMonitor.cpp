@@ -160,7 +160,7 @@ void Initialize(GraphicContext* graphics) {
 	// The draw, dispatch, wait and readback counters (Profiler::Add) count only while this is on.
 	Profiler::g_counters = true;
 	g_window_start       = Clock::now();
-	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 16), a report every %.0f s\n", KYTY_BUILD_LABEL,
+	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 17), a report every %.0f s\n", KYTY_BUILD_LABEL,
 	            kReportSeconds);
 	std::fflush(stdout);
 }
@@ -547,8 +547,31 @@ void Tick() {
 			            static_cast<double>(zone->self_ns) / 1000.0 / static_cast<double>(zone->calls));
 		}
 		std::printf("\n");
+		std::vector<Profiler::PerfZoneStats*> waiters;
+		for (size_t i = 0; i < Profiler::kPerfZoneSlots; i++) {
+			if (table[i].location != nullptr && table[i].gpu_wait_ns != 0) {
+				waiters.push_back(&table[i]);
+			}
+		}
+		std::sort(waiters.begin(), waiters.end(),
+		          [](const auto* a, const auto* b) { return a->gpu_wait_ns > b->gpu_wait_ns; });
+		if (!waiters.empty()) {
+			std::printf("Perf GPU waits (the work that made the GPU thread wait for the card):");
+			for (size_t i = 0; i < std::min<size_t>(waiters.size(), 8); i++) {
+				const auto* zone = waiters[i];
+				const char* name = zone->location->name != nullptr ? zone->location->name
+				                                                   : zone->location->function;
+				std::printf("%s %s %.1f%% (%.1f/frame, %.1f ms each)", i == 0 ? "" : ";", name,
+				            100.0 * static_cast<double>(zone->gpu_wait_ns) / window_ns,
+				            static_cast<double>(zone->gpu_wait_calls) / per_frame_divisor,
+				            static_cast<double>(zone->gpu_wait_ns) / 1e6 /
+				                static_cast<double>(zone->gpu_wait_calls));
+			}
+			std::printf("\n");
+		}
 		for (size_t i = 0; i < Profiler::kPerfZoneSlots; i++) {
 			table[i].self_ns = table[i].total_ns = table[i].calls = 0;
+			table[i].gpu_wait_ns = table[i].gpu_wait_calls = 0;
 		}
 	}
 	std::fflush(stdout);
