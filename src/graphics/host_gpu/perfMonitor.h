@@ -39,6 +39,9 @@ void AddGpuThreadBlocked(double seconds);
 void AddGameReadbackWait(double seconds);
 // The same, with the guest address the game touched (the report names the 1 MB regions whose
 // waits cost most) and whether it was writing.
+// The shader (0: none bound, a command-processor write) that last wrote GPU data into each 1 MB
+// region, named beside the regions the game waits on (Perf readbacks).
+void NoteGpuWrite(uint64_t address, uint64_t size, uint64_t shader_hash);
 void AddGameReadbackWait(double seconds, uint64_t address, bool write);
 
 // A frame was presented (any thread).

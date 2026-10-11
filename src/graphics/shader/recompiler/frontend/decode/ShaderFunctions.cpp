@@ -654,9 +654,22 @@ struct ShaderFunctionExpander::Impl {
 		std::vector<uint32_t> code;
 		uint64_t              hash = 0; // XXH3 of code (ExpandShared)
 	};
+	// A result ExpandShared gave in this epoch (frame) for these exact inputs.
+	struct Memo {
+		uint64_t              epoch     = UINT64_MAX;
+		uint64_t              base      = 0;
+		uint32_t              wave_size = 0;
+		uint32_t              uses      = 0;
+		std::vector<uint32_t> user_data;
+		const Expansion*      expansion = nullptr; // null: no calls (or a failure before one)
+		bool                  ok        = false;
+		std::string           reason;
+	};
 	struct Shader {
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
+		std::array<Memo, 4>    memos {};
+		uint32_t               next_memo = 0;
 	};
 	static constexpr size_t MaxExpansions = 8;
 
@@ -699,7 +712,7 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
                                           const ShaderCodeReader& read,
                                           const std::vector<uint32_t>*& expanded,
                                           uint64_t& expanded_hash, std::string& reason,
-                                          uint32_t wave_size) {
+                                          uint32_t wave_size, uint64_t epoch) {
 	expanded      = nullptr;
 	expanded_hash = 0;
 	reason.clear();
@@ -708,21 +721,56 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 		return false;
 	}
 	auto& shader = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
+	// Within one epoch (the caller passes the presented frame) the same inputs give the same
+	// expansion: the shader and its callees are code the GPU runs from that memory, which the
+	// game cannot rewrite under its own frame's dispatches. Every call compared the whole shader,
+	// re-resolved its calls and re-read every callee: 20-80 us a dispatch, up to 37 % of the GPU
+	// thread (2026-10-11). Each memo is still checked in full after 256 uses, for long epochs.
+	if (epoch != UINT64_MAX && shader.analysis.code.size() == code.size()) {
+		for (auto& memo: shader.memos) {
+			if (memo.epoch == epoch && memo.uses < 256 && memo.base == base &&
+			    memo.wave_size == wave_size && memo.user_data.size() == user_data.size() &&
+			    std::equal(user_data.begin(), user_data.end(), memo.user_data.begin())) {
+				memo.uses++;
+				if (memo.expansion != nullptr) {
+					expanded      = &memo.expansion->code;
+					expanded_hash = memo.expansion->hash;
+				}
+				reason = memo.reason;
+				return memo.ok;
+			}
+		}
+	}
+	auto remember = [&](const Impl::Expansion* expansion, bool ok) {
+		if (epoch == UINT64_MAX) {
+			return ok;
+		}
+		auto& memo     = shader.memos[shader.next_memo++ % shader.memos.size()];
+		memo.epoch     = epoch;
+		memo.base      = base;
+		memo.wave_size = wave_size;
+		memo.uses      = 0;
+		memo.user_data.assign(user_data.begin(), user_data.end());
+		memo.expansion = expansion;
+		memo.ok        = ok;
+		memo.reason    = reason;
+		return ok;
+	};
 	if (shader.analysis.code.size() != code.size() ||
 	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
 		shader = {};
 		AnalyzeShader(code, shader.analysis);
 	}
 	const auto& analysis = shader.analysis;
-	if (!analysis.has_calls) return true;
+	if (!analysis.has_calls) return remember(nullptr, true);
 	if (analysis.has_setpc) {
 		reason = "shader calls combined with indirect branches are unsupported";
-		return false;
+		return remember(nullptr, false);
 	}
 	std::vector<CallSite> sites;
 	std::set<uint32_t>    dependencies;
 	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
-		return false;
+		return remember(nullptr, false);
 	}
 	for (const auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
@@ -731,7 +779,7 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 			expanded      = &expansion.code;
 			expanded_hash = expansion.hash;
 			reason        = expansion.reason;
-			return expansion.ok;
+			return remember(&expansion, expansion.ok);
 		}
 	}
 	Impl::Expansion expansion;
@@ -757,12 +805,16 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 	if (shader.expansions.size() >= Impl::MaxExpansions) {
 		shader.expansions.erase(shader.expansions.begin());
 	}
+	// The list moves: memos pointing into it are dropped.
+	for (auto& memo: shader.memos) {
+		memo.epoch = UINT64_MAX;
+	}
 	shader.expansions.push_back(std::move(expansion));
 	const auto& kept = shader.expansions.back();
 	expanded         = &kept.code;
 	expanded_hash    = kept.hash;
 	reason           = kept.reason;
-	return kept.ok;
+	return remember(&kept, kept.ok);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

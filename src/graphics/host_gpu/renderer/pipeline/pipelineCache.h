@@ -9,7 +9,10 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <thread>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -272,8 +275,16 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
+	// The driver cache is also written during the session (SaveDuringSession), on a thread of
+	// its own: a session that crashes kept none of the pipelines it compiled, and every run then
+	// compiled them again, some for seconds on the GPU thread (2026-10-11).
+	std::thread                                             m_save_thread;
+	std::atomic<bool>                                       m_save_running {false};
+	uint64_t                                                m_saved_builds   = 0;
+	std::chrono::steady_clock::time_point                   m_last_save_check {};
 
 	void InitializeDriverCache();
+	void SaveDuringSession();
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
 };

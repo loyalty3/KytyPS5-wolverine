@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/aftermath.h"
@@ -112,6 +113,15 @@ static void DumpDeviceFault(GraphicContext& graphics) {
 		     vk::to_string(address.addressType).c_str(),
 		     static_cast<uint64_t>(address.reportedAddress),
 		     static_cast<uint64_t>(address.addressPrecision));
+		if (address.addressType != vk::DeviceFaultAddressTypeEXT::eInstructionPointerFault &&
+		    address.addressType != vk::DeviceFaultAddressTypeEXT::eInstructionPointerUnknown &&
+		    address.addressType != vk::DeviceFaultAddressTypeEXT::eInstructionPointerInvalid) {
+			const auto owner = DescribeBufferGpuAddress(
+			    static_cast<uint64_t>(address.reportedAddress),
+			    static_cast<uint64_t>(address.addressPrecision));
+			std::printf("    %s\n", owner.c_str());
+			LOGF("    %s\n", owner.c_str());
+		}
 	}
 	for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
 		const auto& vendor = vendors[i];

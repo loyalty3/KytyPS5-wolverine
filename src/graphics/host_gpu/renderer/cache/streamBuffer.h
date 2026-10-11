@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <utility>
+#include <string>
 #include <vector>
 
 VK_DEFINE_HANDLE(VmaAllocation)
@@ -239,6 +240,9 @@ private:
 	size_t                m_wait_cursor = 0;
 	uint64_t              m_wait_bound  = 0;
 };
+
+// Device-fault report: whose buffer memory a faulting GPU address falls in.
+std::string DescribeBufferGpuAddress(uint64_t address, uint64_t precision);
 
 } // namespace Libs::Graphics
 

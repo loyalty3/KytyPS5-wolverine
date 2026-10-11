@@ -509,6 +509,9 @@ struct PendingGraphicsPipeline {
 };
 
 // Counts a finished pipeline build and puts it on the timeline (slow ones as a warning).
+// Pipelines built this session (PipelineCache::SaveDuringSession).
+static std::atomic<uint64_t> g_pipelines_built {0};
+
 static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uint64_t first_hash,
                                 uint64_t second_hash, std::chrono::steady_clock::time_point begin) {
 	const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -516,6 +519,7 @@ static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uin
 	                                         .count());
 	Profiler::Add(counter);
 	Profiler::Add(Profiler::Counter::PipelineBuildTime, us);
+	g_pipelines_built.fetch_add(1, std::memory_order_relaxed);
 	Profiler::Message(us >= 100000 ? Profiler::MessageWarning : Profiler::MessageInfo,
 	                  "%s pipeline built in %.1f ms: 0x%016" PRIx64 " 0x%016" PRIx64, kind,
 	                  static_cast<double>(us) / 1000.0, first_hash, second_hash);
@@ -1559,7 +1563,7 @@ struct PipelineCache::ProgramCache {
 		        [](uint64_t address, std::span<uint32_t> words) {
 			        return ReadShaderGuestMemoryRaw(nullptr, address, words);
 		        },
-		        expanded, expanded_hash, reason, wave_size)) {
+		        expanded, expanded_hash, reason, wave_size, expansion_epoch)) {
 			static std::atomic<uint32_t> reports {0};
 			if (reports.fetch_add(1) < 16) {
 				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
@@ -1595,6 +1599,8 @@ struct PipelineCache::ProgramCache {
 		lookup_key.function_size = size;
 	}
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
+	// The presented frame (PipelineCache::GetComputeProgram): expansions are reused within it.
+	uint64_t                                                       expansion_epoch = UINT64_MAX;
 	ProgramKey                                                     lookup_key;
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
@@ -2112,17 +2118,10 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-void PipelineCache::Save() {
-	m_program_cache->FlushDisk();
-	// No worker may use the driver cache once it is destroyed below; later pipelines are
-	// compiled on the GPU thread (FinishPending).
-	if (m_compiler != nullptr) {
-		m_compiler->Stop();
-	}
-	if (m_driver_cache == nullptr) {
-		return;
-	}
-
+// Writes the driver cache's data to its file (through a temporary file, renamed into place).
+// The cache is not externally synchronized: pipelines may be created into it meanwhile.
+static bool WriteDriverCache(GraphicContext& m_graphics, vk::PipelineCache m_driver_cache,
+                             const std::filesystem::path& m_driver_cache_path) {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -2143,7 +2142,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -2151,7 +2150,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -2168,10 +2167,52 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
+	return true;
+}
+
+void PipelineCache::SaveDuringSession() {
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_save_check < std::chrono::seconds(60)) {
+		return;
+	}
+	m_last_save_check = now;
+	const auto built  = g_pipelines_built.load(std::memory_order_relaxed);
+	if (m_driver_cache == nullptr || built == m_saved_builds ||
+	    m_save_running.load(std::memory_order_acquire)) {
+		return;
+	}
+	m_saved_builds = built;
+	if (m_save_thread.joinable()) {
+		m_save_thread.join();
+	}
+	// The shader disk cache too, here on the GPU thread that owns it.
+	m_program_cache->FlushDisk();
+	m_save_running.store(true, std::memory_order_release);
+	m_save_thread = std::thread([this] {
+		(void)WriteDriverCache(m_graphics, m_driver_cache, m_driver_cache_path);
+		m_save_running.store(false, std::memory_order_release);
+	});
+}
+
+void PipelineCache::Save() {
+	if (m_save_thread.joinable()) {
+		m_save_thread.join();
+	}
+	m_program_cache->FlushDisk();
+	// No worker may use the driver cache once it is destroyed below; later pipelines are
+	// compiled on the GPU thread (FinishPending).
+	if (m_compiler != nullptr) {
+		m_compiler->Stop();
+	}
+	if (m_driver_cache == nullptr) {
+		return;
+	}
+
+	(void)WriteDriverCache(m_graphics, m_driver_cache, m_driver_cache_path);
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
 }
@@ -2424,6 +2465,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	m_program_cache->expansion_epoch = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	const auto        params      = [&] {
 		KYTY_PROFILER_BLOCK("ProgramCache::PrepareCompute");
 		return PrepareProgram(regs, sh, input_info);
@@ -2494,6 +2536,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs, bool may_defer) {
 	KYTY_PROFILER_FUNCTION();
+	SaveDuringSession();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;

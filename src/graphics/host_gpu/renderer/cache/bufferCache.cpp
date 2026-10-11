@@ -1418,6 +1418,7 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
+	PerfMonitor::NoteGpuWrite(vaddr, size, s_diag_shader_hash);
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		const auto first = Common::AlignDown(vaddr, WriteBitmapPage);

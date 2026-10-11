@@ -9,6 +9,11 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
+#include <chrono>
+#include <array>
+#include <string>
+#include <mutex>
+#include <map>
 #include <atomic>
 #include <cstdio>
 #include <span>
@@ -19,6 +24,98 @@
 #include <vk_mem_alloc.h>
 
 namespace Libs::Graphics {
+
+namespace {
+// Device addresses of the buffers that have one, live and recently destroyed, for the device-fault
+// report: the GPU has read an invalid address in a vertex shader of DrawIndexAuto draws in three
+// sessions (2026-10-11), and the report could not say whose memory it was.
+struct AddressEntry {
+	uint64_t      gpu_address = 0;
+	uint64_t      size        = 0;
+	uint64_t      cpu_address = 0;
+	bool          sparse      = false;
+	const Buffer* buffer      = nullptr;
+	uint64_t      freed_ms    = 0;
+};
+std::mutex                             g_address_mutex;
+std::map<uint64_t, AddressEntry>       g_live_addresses;
+std::array<AddressEntry, 4096>         g_freed_addresses {};
+uint64_t                               g_freed_next = 0;
+
+uint64_t NowMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void RegisterAddress(const Buffer* buffer, uint64_t gpu_address, uint64_t size,
+                     uint64_t cpu_address, bool sparse) {
+	std::lock_guard lock(g_address_mutex);
+	g_live_addresses[gpu_address] = {gpu_address, size, cpu_address, sparse, buffer, 0};
+}
+
+void UnregisterAddress(uint64_t gpu_address) {
+	std::lock_guard lock(g_address_mutex);
+	const auto found = g_live_addresses.find(gpu_address);
+	if (found == g_live_addresses.end()) {
+		return;
+	}
+	auto entry      = found->second;
+	entry.buffer    = nullptr;
+	entry.freed_ms  = NowMs();
+	g_freed_addresses[g_freed_next++ % g_freed_addresses.size()] = entry;
+	g_live_addresses.erase(found);
+}
+} // namespace
+
+std::string DescribeBufferGpuAddress(uint64_t address, uint64_t precision) {
+	std::unique_lock lock(g_address_mutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		return "buffer address registry busy";
+	}
+	const auto end = address + std::max<uint64_t>(precision, 1);
+	char       line[256];
+	std::string text;
+	auto       it = g_live_addresses.upper_bound(address);
+	if (it != g_live_addresses.begin()) {
+		--it;
+	}
+	for (; it != g_live_addresses.end() && it->first < end; ++it) {
+		const auto& e = it->second;
+		if (e.gpu_address + e.size <= address) {
+			continue;
+		}
+		const auto offset = address > e.gpu_address ? address - e.gpu_address : 0;
+		const char* state = "";
+		if (e.sparse && e.buffer != nullptr && offset < e.size) {
+			state = e.buffer->ChunkState(offset) == Buffer::ChunkUnbound ? ", chunk unbacked"
+			                                                             : ", chunk backed";
+		}
+		std::snprintf(line, sizeof(line),
+		              "inside a live buffer (guest 0x%010llx, %llu KB%s, offset 0x%llx%s); ",
+		              static_cast<unsigned long long>(e.cpu_address),
+		              static_cast<unsigned long long>(e.size >> 10u), e.sparse ? ", sparse" : "",
+		              static_cast<unsigned long long>(offset), state);
+		text += line;
+	}
+	const auto now = NowMs();
+	for (const auto& e: g_freed_addresses) {
+		if (e.size != 0 && e.gpu_address < end && address < e.gpu_address + e.size) {
+			std::snprintf(line, sizeof(line),
+			              "inside a destroyed buffer (guest 0x%010llx, %llu KB, destroyed %llu ms "
+			              "before); ",
+			              static_cast<unsigned long long>(e.cpu_address),
+			              static_cast<unsigned long long>(e.size >> 10u),
+			              static_cast<unsigned long long>(now - e.freed_ms));
+			text += line;
+		}
+	}
+	if (text.empty()) {
+		text = "in no buffer with a device address, live or among the last 4096 destroyed "
+		       "(an image, or memory outside the buffer cache)";
+	}
+	return text;
+}
 
 namespace {
 
@@ -132,6 +229,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		RegisterAddress(this, m_device_address, size, cpu_address, false);
 	}
 
 	VkMemoryPropertyFlags properties = 0;
@@ -178,10 +276,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseTag,
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		RegisterAddress(this, m_device_address, size, cpu_address, true);
 	}
 }
 
 Buffer::~Buffer() {
+	if (m_device_address != 0) {
+		UnregisterAddress(m_device_address);
+	}
 	if (m_sparse) {
 		// Unbinding is implicit: the buffer goes first, then the memory it was bound to.
 		if (m_buffer != nullptr) {

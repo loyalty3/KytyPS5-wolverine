@@ -46,7 +46,7 @@ public:
 	bool ExpandShared(std::span<const uint32_t> code, uint64_t base,
 	                  std::span<const uint32_t> user_data, const ShaderCodeReader& read,
 	                  const std::vector<uint32_t>*& expanded, uint64_t& expanded_hash,
-	                  std::string& reason, uint32_t wave_size);
+	                  std::string& reason, uint32_t wave_size, uint64_t epoch = UINT64_MAX);
 
 private:
 	struct Impl;

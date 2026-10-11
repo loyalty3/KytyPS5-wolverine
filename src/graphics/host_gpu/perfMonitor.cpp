@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics::PerfMonitor {
@@ -117,6 +118,8 @@ struct ReadbackRegion {
 };
 std::mutex                  g_readback_mutex;
 std::vector<ReadbackRegion> g_readback_regions;
+std::mutex                             g_writer_mutex;
+std::unordered_map<uint64_t, uint64_t> g_region_writers; // 1 MB region -> last shader
 
 // Owned by the GPU thread (Tick).
 Clock::time_point g_window_start {};
@@ -155,7 +158,7 @@ void Initialize(GraphicContext* graphics) {
 	// The draw, dispatch, wait and readback counters (Profiler::Add) count only while this is on.
 	Profiler::g_counters = true;
 	g_window_start       = Clock::now();
-	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 13), a report every %.0f s\n", KYTY_BUILD_LABEL,
+	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 14), a report every %.0f s\n", KYTY_BUILD_LABEL,
 	            kReportSeconds);
 	std::fflush(stdout);
 }
@@ -185,6 +188,18 @@ void AddGameReadbackWait(double seconds) {
 	auto max = g_readback_max_ns.load(std::memory_order_relaxed);
 	while (ns > max &&
 	       !g_readback_max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
+	}
+}
+
+void NoteGpuWrite(uint64_t address, uint64_t size, uint64_t shader_hash) {
+	if (!g_enabled || size == 0) {
+		return;
+	}
+	const auto first = address >> 20u;
+	const auto last  = std::min((address + size - 1) >> 20u, first + 63);
+	std::scoped_lock lock(g_writer_mutex);
+	for (auto region = first; region <= last; region++) {
+		g_region_writers[region] = shader_hash;
 	}
 }
 
@@ -439,9 +454,26 @@ void Tick() {
 		if (!regions.empty()) {
 			std::printf("Perf readbacks (1 MB regions the game waited on most):");
 			for (size_t i = 0; i < std::min<size_t>(regions.size(), 6); i++) {
-				std::printf(" 0x%010" PRIx64 " %" PRIu64 "x (%" PRIu64 " writing) %.0f ms;",
+				uint64_t writer = 0;
+				bool     known  = false;
+				{
+					std::scoped_lock writer_lock(g_writer_mutex);
+					if (const auto found = g_region_writers.find(regions[i].region);
+					    found != g_region_writers.end()) {
+						writer = found->second;
+						known  = true;
+					}
+				}
+				std::printf(" 0x%010" PRIx64 " %" PRIu64 "x (%" PRIu64 " writing) %.0f ms", 
 				            regions[i].region << 20u, regions[i].count, regions[i].writes,
 				            static_cast<double>(regions[i].wait_ns) / 1e6);
+				if (!known) {
+					std::printf(";");
+				} else if (writer != 0) {
+					std::printf(" [written by shader 0x%016" PRIx64 "];", writer);
+				} else {
+					std::printf(" [written outside a shader binding];");
+				}
 			}
 			std::printf(" %zu regions in all\n", regions.size());
 		}
