@@ -113,6 +113,10 @@ public:
 	// Bytes bound so far (sparse), or the whole size (dense).
 	[[nodiscard]] uint64_t ResidentBytes() const noexcept; // in video memory
 	[[nodiscard]] uint64_t HostResidentBytes() const noexcept; // sparse chunks in system memory
+	// Whether cold chunks can live in system memory. NVIDIA on Windows offers sparse buffers video
+	// memory only: the cold chunks of Patch 10 fell back to it, and the geometry pool filled the
+	// card all the same (2026-10-11, the line said "system memory" and the pool showed 0 MB there).
+	[[nodiscard]] bool     CanHoldHost() const noexcept { return m_host_type_bits != 0; }
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }

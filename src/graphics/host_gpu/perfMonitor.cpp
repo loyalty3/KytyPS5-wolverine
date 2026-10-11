@@ -155,7 +155,7 @@ void Initialize(GraphicContext* graphics) {
 	// The draw, dispatch, wait and readback counters (Profiler::Add) count only while this is on.
 	Profiler::g_counters = true;
 	g_window_start       = Clock::now();
-	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 11), a report every %.0f s\n", KYTY_BUILD_LABEL,
+	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 12), a report every %.0f s\n", KYTY_BUILD_LABEL,
 	            kReportSeconds);
 	std::fflush(stdout);
 }
@@ -413,8 +413,14 @@ void Tick() {
 				}
 				std::printf(i + 1 < g_buf_snapshot.large_count ? ";" : "");
 			}
-			std::printf(" | zero uploads left unbacked %" PRIu64 " MB\n",
-			            g_buf_snapshot.sparse_skipped_bytes >> 20u);
+			std::printf(" | zero uploads left unbacked %" PRIu64 " MB", g_buf_snapshot.sparse_skipped_bytes >> 20u);
+			if (g_buf_snapshot.lazy_unbacked_bytes != 0) {
+				std::printf(" | written bindings left unbacked %" PRIu64 " MB, backed after the shader "
+				            "wrote there %" PRIu64 " MB, pages written while unbacked %" PRIu64,
+				            g_buf_snapshot.lazy_unbacked_bytes >> 20u,
+				            g_buf_snapshot.lazy_backed_bytes >> 20u, g_buf_snapshot.lazy_lost_pages);
+			}
+			std::printf("\n");
 			const bool due = std::chrono::duration<double>(now - g_scan_last).count() >= kScanSeconds;
 			if (due && !g_scan_running.exchange(true, std::memory_order_acq_rel)) {
 				g_scan_last = now;

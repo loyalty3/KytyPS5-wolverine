@@ -507,8 +507,6 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
@@ -516,28 +514,44 @@ public:
 		// spans thousands of mappings, and while the game streams (it maps memory hundreds of
 		// times a second) the per-thread answers of TryClampRangeSize keep missing, so the walk
 		// below ran under the lock at ~4 us a call (the helicopter cut, 2026-10-09).
-		// KYTY_CLAMP_SPANS=0 walks the ranges as before.
+		// The spans are published as a snapshot and searched without the lock while coverage is
+		// unchanged: under the lock, the GPU thread queued behind the game thread's mapping calls
+		// and the other threads' searches at 85-220 us a call, 40 % of its time (2026-10-11).
+		// Coverage is bumped before a change is made, so a snapshot of the current generation
+		// is never older than the ranges.
+		// KYTY_CLAMP_SPANS=0 walks the ranges under the lock as before.
 		static const bool spans = [] {
 			const char* value = std::getenv("KYTY_CLAMP_SPANS");
 			return value == nullptr || value[0] != '0';
 		}();
 		if (spans) {
-			const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
-			if (m_spans_generation != generation) {
-				KYTY_PROFILER_BLOCK("ClampRangeSize::RebuildSpans");
-				RebuildSpansUnlocked();
-				m_spans_generation = generation;
+			const auto generation = m_coverage_generation.load(std::memory_order_acquire);
+			auto snapshot = std::atomic_load_explicit(&m_span_snapshot, std::memory_order_acquire);
+			if (snapshot == nullptr || snapshot->generation != generation) {
+				Common::LockGuard lock(m_mutex);
+				const auto current = m_coverage_generation.load(std::memory_order_relaxed);
+				snapshot = std::atomic_load_explicit(&m_span_snapshot, std::memory_order_relaxed);
+				if (snapshot == nullptr || snapshot->generation != current) {
+					KYTY_PROFILER_BLOCK("ClampRangeSize::RebuildSpans");
+					auto fresh        = std::make_shared<SpanSnapshot>();
+					fresh->generation = current;
+					RebuildSpansUnlocked(fresh->spans);
+					snapshot = std::move(fresh);
+					std::atomic_store_explicit(&m_span_snapshot, snapshot, std::memory_order_release);
+				}
 			}
-			auto span = std::upper_bound(
-			    m_spans.begin(), m_spans.end(), virtual_addr,
+			const auto& list = snapshot->spans;
+			auto        span = std::upper_bound(
+			    list.begin(), list.end(), virtual_addr,
 			    [](uint64_t value, const Span& candidate) { return value < candidate.start; });
-			if (span == m_spans.begin()) {
+			if (span == list.begin()) {
 				return 0;
 			}
 			--span;
 			return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
 		}
 
+		Common::LockGuard lock(m_mutex);
 		auto vma = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), virtual_addr,
 		    [](uint64_t value, const Range& range) { return value < range.start; });
@@ -602,20 +616,24 @@ private:
 		uint64_t start = 0;
 		uint64_t end   = 0;
 	};
-	void RebuildSpansUnlocked() {
-		m_spans.clear();
+	void RebuildSpansUnlocked(std::vector<Span>& spans) const {
+		spans.clear();
 		for (const auto& r: m_ranges) {
 			if (!IsCommittedRangeType(r.type) || r.size == 0) {
 				continue;
 			}
 			const auto end = End(r.start, r.size);
-			if (!m_spans.empty() && m_spans.back().end == r.start) {
-				m_spans.back().end = end;
+			if (!spans.empty() && spans.back().end == r.start) {
+				spans.back().end = end;
 			} else {
-				m_spans.push_back({r.start, end});
+				spans.push_back({r.start, end});
 			}
 		}
 	}
+	struct SpanSnapshot {
+		uint64_t          generation = 0;
+		std::vector<Span> spans;
+	};
 
 	static bool SameMergeKey(const Range& left, const Range& right) {
 		if (left.disallow_merge || right.disallow_merge || left.type == VirtualRangeType::Direct ||
@@ -804,8 +822,8 @@ private:
 		change.additive.store(additive, std::memory_order_relaxed);
 		change.generation.store(generation, std::memory_order_release);
 	}
-	std::vector<Span>     m_spans;
-	uint64_t              m_spans_generation = 0;
+	// Read with std::atomic_load (ClampRangeSize), replaced under m_mutex.
+	std::shared_ptr<const SpanSnapshot> m_span_snapshot;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

@@ -19,6 +19,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <fmt/format.h>
 #include <atomic>
 #include <chrono>
@@ -191,7 +192,8 @@ static void MakeResidentNamed(Buffer& buffer, uint64_t offset, uint64_t size, co
 			            " at once (range 0x%010" PRIx64 "+%" PRIu64 " MB, shader 0x%016" PRIx64
 			            ") in %s memory\n",
 			            why, bytes >> 20u, buffer.CpuAddress(), buffer.CpuAddress() + offset,
-			            size >> 20u, BufferCache::s_diag_shader_hash, cold ? "system" : "video");
+			            size >> 20u, BufferCache::s_diag_shader_hash,
+			            cold && buffer.CanHoldHost() ? "system" : "video");
 			std::fflush(stdout);
 		}
 	}
@@ -1236,6 +1238,15 @@ vk::DeviceAddress BufferCache::WriteBitmapAddress() {
 	return m_write_bitmap->BufferDeviceAddress();
 }
 
+// KYTY_LAZY_SPARSE_WRITES=0 backs a tracked written binding over a sparse buffer whole, as before.
+static bool LazySparseWrites() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LAZY_SPARSE_WRITES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, uint64_t size,
                                                               BufferId id) {
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
@@ -1244,7 +1255,42 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
-	MakeResidentNamed(buffer, buffer.Offset(vaddr), size, "a tracked written binding", true);
+	// Shader 0x2ea3957af2daf690 binds Wolverine's whole 2.7 GB geometry pool for writing, and
+	// backing it put 1.5 GB of zeros in video memory: the card ran past its budget and the second
+	// half stalled on the GPU (2026-10-11). System memory is not on offer for sparse buffers there
+	// (Buffer::CanHoldHost). A tracked binding marks every page its stores reach in the write
+	// bitmap, so the unbacked part is left unbacked: unbacked memory reads zero, as the guest's
+	// unwritten zeros do, and ScanLazyWrites backs the chunks the shader is seen writing.
+	bool lazy = false;
+	if (buffer.IsSparse() && !buffer.CanHoldHost() && LazySparseWrites() &&
+	    m_write_bitmap != nullptr) {
+		for (const auto& entry: m_lazy_writes) {
+			if (entry.id == id && entry.address <= vaddr &&
+			    vaddr + size <= entry.address + entry.size) {
+				lazy = true;
+				break;
+			}
+		}
+		if (!lazy) {
+			if (const auto unbound = buffer.UnboundBytes(buffer.Offset(vaddr), size);
+			    unbound >= (64ull << 20u)) {
+				lazy = true;
+				m_lazy_writes.push_back({id, vaddr, size});
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1) < 8) {
+					std::printf("BufferCache: a tracked written binding over %" PRIu64
+					            " MB of unbacked sparse buffer (range 0x%010" PRIx64 "+%" PRIu64
+					            " MB, shader 0x%016" PRIx64
+					            ") stays unbacked; chunks it writes are backed as seen\n",
+					            unbound >> 20u, vaddr, size >> 20u, s_diag_shader_hash);
+					std::fflush(stdout);
+				}
+			}
+		}
+	}
+	if (!lazy) {
+		MakeResidentNamed(buffer, buffer.Offset(vaddr), size, "a tracked written binding", true);
+	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, true, false);
 	MarkGpuWritten(vaddr, size, true);
 	return {&buffer, buffer.Offset(vaddr)};
@@ -1329,8 +1375,16 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 					}
 					dropped++;
 				} else {
-					local[slot] &= ~bit; // downloaded with the window now
-					cleared[slot] |= bit;
+					// A write into an unbacked chunk of a lazily backed binding: the bit stays for
+					// ScanLazyWrites to back the chunk (the write itself was dropped).
+					const bool unbacked = buffer.IsSparse() && page >= buffer.CpuAddress() &&
+					                      page - buffer.CpuAddress() < buffer.Size() &&
+					                      buffer.ChunkState(page - buffer.CpuAddress()) ==
+					                          Buffer::ChunkUnbound;
+					if (!unbacked) {
+						local[slot] &= ~bit; // downloaded with the window now
+						cleared[slot] |= bit;
+					}
 					m_bitmap_written_pages++;
 				}
 			}
@@ -1591,8 +1645,86 @@ uint64_t BufferCache::LruClock() const noexcept {
 	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
 }
 
+// The chunks of lazily backed written bindings (ObtainBufferTracked) that the write bitmap shows
+// written are backed, four times a second. Writes that landed before are lost (they read zero),
+// and counted: KYTY_LAZY_SPARSE_WRITES=0 if any matter.
+void BufferCache::ScanLazyWrites() {
+	if (m_lazy_writes.empty() || m_write_bitmap == nullptr) {
+		return;
+	}
+	const auto now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                              std::chrono::steady_clock::now().time_since_epoch())
+	                                              .count());
+	if (now_ms - m_lazy_scan_ms < 250) {
+		return;
+	}
+	m_lazy_scan_ms = now_ms;
+	KYTY_PROFILER_FUNCTION();
+	const auto*                       words = reinterpret_cast<const uint32_t*>(m_write_bitmap->Mapped().data());
+	constexpr uint64_t                word_span = WriteBitmapPage * 32u;
+	thread_local std::vector<uint32_t> local;
+	for (auto it = m_lazy_writes.begin(); it != m_lazy_writes.end();) {
+		auto* buffer = m_slot_buffers.try_get(it->id);
+		if (buffer == nullptr || buffer->is_deleted || !buffer->IsSparse() ||
+		    it->address < buffer->CpuAddress() ||
+		    it->address + it->size > buffer->CpuAddress() + buffer->Size()) {
+			it = m_lazy_writes.erase(it);
+			continue;
+		}
+		const auto begin = Common::AlignDown(it->address, word_span);
+		const auto end   = std::min(Common::AlignUp(it->address + it->size, word_span), WriteBitmapLimit);
+		if (begin >= end) {
+			++it;
+			continue;
+		}
+		const auto first_word = begin / word_span;
+		local.resize(static_cast<size_t>((end - begin) / word_span));
+		// One copy out of the bitmap (device memory reached over the bus, uncached).
+		std::memcpy(local.data(), words + first_word, local.size() * sizeof(uint32_t));
+		const auto                                 base  = buffer->CpuAddress();
+		const auto                                 chunk = buffer->ChunkSize();
+		std::vector<std::pair<uint64_t, uint64_t>> bind;
+		uint64_t                                   lost = 0;
+		for (size_t i = 0; i < local.size(); i++) {
+			auto word = local[i];
+			while (word != 0) {
+				const auto bit = static_cast<uint64_t>(std::countr_zero(word));
+				word &= word - 1u;
+				const auto page = ((first_word + i) * 32u + bit) << WriteBitmapPageBits;
+				if (page < base || page >= base + buffer->Size()) {
+					continue;
+				}
+				const auto offset = page - base;
+				if (buffer->ChunkState(offset) != Buffer::ChunkUnbound) {
+					continue;
+				}
+				lost++;
+				const auto start  = Common::AlignDown(offset, chunk);
+				const auto length = std::min(chunk, buffer->Size() - start);
+				if (!bind.empty() && bind.back().first + bind.back().second >= start) {
+					const auto stop     = std::max(bind.back().first + bind.back().second, start + length);
+					bind.back().second  = stop - bind.back().first;
+				} else {
+					bind.emplace_back(start, length);
+				}
+			}
+		}
+		if (!bind.empty()) {
+			const auto before = buffer->ResidentBytes();
+			{
+				const Buffer::BindScope scope("chunks a written binding wrote", true, false);
+				buffer->MakeResidentRanges(bind);
+			}
+			m_lazy_backed += buffer->ResidentBytes() - before;
+			m_lazy_lost_pages += lost;
+		}
+		++it;
+	}
+}
+
 void BufferCache::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
+	ScanLazyWrites();
 	m_gc_tick++;
 	const auto clock = LruClock();
 	// Sparse buffers count by the video memory backing them.
@@ -1649,6 +1781,15 @@ void BufferCache::RunGarbageCollector() {
 			}
 		}
 		snapshot.sparse_skipped_bytes = std::exchange(m_sparse_skipped_bytes, 0);
+		for (const auto& entry: m_lazy_writes) {
+			const auto* lazy = m_slot_buffers.try_get(entry.id);
+			if (lazy != nullptr && !lazy->is_deleted && entry.address >= lazy->CpuAddress() &&
+			    entry.address + entry.size <= lazy->CpuAddress() + lazy->Size()) {
+				snapshot.lazy_unbacked_bytes += lazy->UnboundBytes(lazy->Offset(entry.address), entry.size);
+			}
+		}
+		snapshot.lazy_backed_bytes = m_lazy_backed;
+		snapshot.lazy_lost_pages   = m_lazy_lost_pages;
 		PerfMonitor::SetBufferSnapshot(snapshot);
 	}
 	if (used < m_trigger_gc_memory) {

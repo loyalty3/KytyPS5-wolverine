@@ -201,6 +201,19 @@ private:
 	bool                                               m_sparse_all_resident  = false;
 	std::vector<BufferId>                              m_sparse_buffers; // registered sparse mirrors
 	uint64_t                                           m_sparse_skipped_bytes = 0; // KYTY_PERF
+	// Tracked written bindings left unbacked (KYTY_LAZY_SPARSE_WRITES): the chunks the shader
+	// writes are found in the write bitmap and backed (ScanLazyWrites).
+	struct LazyWrite {
+		BufferId id;
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	std::vector<LazyWrite>                             m_lazy_writes;
+	uint64_t                                           m_lazy_scan_ms     = 0;
+	uint64_t                                           m_lazy_unbacked    = 0; // KYTY_PERF
+	uint64_t                                           m_lazy_backed      = 0;
+	uint64_t                                           m_lazy_lost_pages  = 0;
+	void                                               ScanLazyWrites();
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;

@@ -73,6 +73,9 @@ struct BufferSnapshot {
 	std::array<uint64_t, MaxLarge>                       large_resident {}; // video memory backing it
 	std::array<uint64_t, MaxLarge>                       large_host {}; // system memory backing it
 	uint64_t sparse_skipped_bytes = 0; // all-zero upload bytes left unbacked since the last report
+	uint64_t lazy_unbacked_bytes  = 0; // written bindings left unbacked (KYTY_LAZY_SPARSE_WRITES)
+	uint64_t lazy_backed_bytes    = 0; // of those, chunks backed since because the shader wrote them
+	uint64_t lazy_lost_pages      = 0; // pages a shader wrote while still unbacked (writes dropped)
 };
 
 // Texture cache events, in bytes, for the report's churn line: what was made and why images
