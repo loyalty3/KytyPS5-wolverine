@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -2461,6 +2462,55 @@ bool PipelineCache::IsSkipListed(uint64_t shader_addr) {
 	return SkipShaderRequested(ShaderDeclaredHash(shader_addr));
 }
 
+// Diagnostics: KYTY_DUMP_SHADER=<hash>[,<hash>...] prints a compute shader's disassembly once
+// and the inputs of its first 8 dispatches (user data, workgroups) to the console. The game waits
+// on memory a 9-instruction shader writes, once a frame (2026-10-11): what it computes decides
+// whether that wait can go.
+static void DumpComputeShader(const ShaderParams& params, const ShaderComputeInputInfo& info) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		const char*           value = std::getenv("KYTY_DUMP_SHADER");
+		while (value != nullptr && *value != '\0') {
+			char* end = nullptr;
+			result.push_back(std::strtoull(value, &end, 16));
+			value = end != nullptr && *end == ',' ? end + 1 : nullptr;
+		}
+		return result;
+	}();
+	if (hashes.empty() || std::find(hashes.begin(), hashes.end(), params.hash) == hashes.end()) {
+		return;
+	}
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, uint32_t> seen;
+	std::lock_guard                               lock(mutex);
+	auto&                                         count = seen[params.hash];
+	if (count >= 8) {
+		return;
+	}
+	if (count == 0) {
+		ShaderRecompiler::Decoder::Program program;
+		ShaderRecompiler::Decoder::DecodeProgram(params.code, program);
+		std::printf("ShaderDump 0x%016" PRIx64 " at 0x%010" PRIx64 " (%zu words):\n%s\n",
+		            params.hash, params.Base(), params.code.size(),
+		            ShaderRecompiler::Decoder::ProgramToString(program).c_str());
+		std::printf("ShaderDump 0x%016" PRIx64 " code:", params.hash);
+		for (size_t i = 0; i < params.code.size(); i++) {
+			std::printf("%s%08x", i % 8 == 0 ? "\n  " : " ", params.code[i]);
+		}
+		std::printf("\n");
+	}
+	count++;
+	std::printf("ShaderDump 0x%016" PRIx64 " dispatch %u: groups %ux%ux%u threads %ux%ux%u, user data",
+	            params.hash, count, info.workgroup_counts[0], info.workgroup_counts[1],
+	            info.workgroup_counts[2], info.threads_num[0], info.threads_num[1],
+	            info.threads_num[2]);
+	for (uint32_t i = 0; i < params.user_data_count; i++) {
+		std::printf(" %08x", params.user_data[i]);
+	}
+	std::printf("\n");
+	std::fflush(stdout);
+}
+
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
@@ -2472,6 +2522,7 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	}();
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	DumpComputeShader(params, input_info);
 	uint32_t          push_data_cursor = 0;
 	auto              program          = m_program_cache->Get(params, input_info, push_data_cursor);
 	if (program && DrawPrep::Enabled()) {

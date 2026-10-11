@@ -160,7 +160,7 @@ void Initialize(GraphicContext* graphics) {
 	// The draw, dispatch, wait and readback counters (Profiler::Add) count only while this is on.
 	Profiler::g_counters = true;
 	g_window_start       = Clock::now();
-	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 15), a report every %.0f s\n", KYTY_BUILD_LABEL,
+	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 16), a report every %.0f s\n", KYTY_BUILD_LABEL,
 	            kReportSeconds);
 	std::fflush(stdout);
 }
