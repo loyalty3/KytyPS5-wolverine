@@ -248,7 +248,7 @@ public:
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
-		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		BumpCoverage(start, size);
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -280,7 +280,7 @@ public:
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
-		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		BumpCoverage(start, size);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -313,7 +313,7 @@ public:
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
-		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		BumpCoverage(start, size);
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -330,7 +330,7 @@ public:
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
-		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
+		BumpCoverage(start, size);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -471,6 +471,35 @@ public:
 	// replace, release); protection, name and memory type changes leave it.
 	[[nodiscard]] uint64_t CoverageGeneration() const noexcept {
 		return m_coverage_generation.load(std::memory_order_acquire);
+	}
+
+	// True when no coverage change after generation `from` up to `to` touched [start, end): an
+	// answer TryClampRangeSize gave at `from` for that range still holds. The game maps memory
+	// hundreds of times a second, nearly always away from the heaps its descriptors span, and
+	// the per-thread answers were thrown away on every change: the GPU thread then spent up to
+	// 60 % of its time in ClampRangeSize (Wolverine combat, 2026-10-11). False when unsure (the
+	// log wrapped, or an entry is being written).
+	[[nodiscard]] bool CoverageUnchanged(uint64_t from, uint64_t to, uint64_t start,
+	                                     uint64_t end) const noexcept {
+		if (to < from || to - from >= kCoverageLog) {
+			return false;
+		}
+		for (auto generation = from + 1; generation <= to; generation++) {
+			const auto& change = m_coverage_log[generation % kCoverageLog];
+			if (change.generation.load(std::memory_order_acquire) != generation) {
+				return false;
+			}
+			const auto change_start = change.start.load(std::memory_order_relaxed);
+			const auto change_end   = change.end.load(std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (change.generation.load(std::memory_order_relaxed) != generation) {
+				return false;
+			}
+			if (change_start < end && start < change_end) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
@@ -748,6 +777,24 @@ private:
 	// Bumped by the changes of committed coverage (CoverageGeneration): TryClampRangeSize's
 	// per-thread answers and m_spans are valid while it is unchanged.
 	std::atomic<uint64_t> m_coverage_generation {1};
+	// The ranges of the last coverage changes, by generation (CoverageUnchanged). Written under
+	// m_mutex; read without it, each entry checked by its generation before and after.
+	static constexpr uint64_t kCoverageLog = 4096;
+	struct CoverageChange {
+		std::atomic<uint64_t> generation {0};
+		std::atomic<uint64_t> start {0};
+		std::atomic<uint64_t> end {0};
+	};
+	std::array<CoverageChange, kCoverageLog> m_coverage_log {};
+	void BumpCoverage(uint64_t start, uint64_t size) {
+		const auto generation = m_coverage_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+		auto&      change     = m_coverage_log[generation % kCoverageLog];
+		change.generation.store(0, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		change.start.store(start, std::memory_order_relaxed);
+		change.end.store(End(start, size), std::memory_order_relaxed);
+		change.generation.store(generation, std::memory_order_release);
+	}
 	std::vector<Span>     m_spans;
 	uint64_t              m_spans_generation = 0;
 };
@@ -1059,11 +1106,20 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 		const char* value = std::getenv("KYTY_CLAMP_CACHE");
 		return value == nullptr || value[0] != '0';
 	}();
-	thread_local std::array<Answer, 64> answers {};
+	thread_local std::array<Answer, 1024> answers {};
 	const auto generation = g_virtual_ranges->CoverageGeneration();
-	auto&      answer     = answers[((vaddr >> 12u) ^ (size >> 12u) ^ size) & 63u];
-	if (cached && answer.generation == generation && answer.vaddr == vaddr && answer.size == size) {
-		return answer.clamped;
+	const auto hash       = ((vaddr >> 8u) ^ (size * 0x9E3779B97F4A7C15ull)) * 0xBF58476D1CE4E5B9ull;
+	auto&      answer     = answers[(hash >> 54u) & 1023u];
+	if (cached && answer.vaddr == vaddr && answer.size == size && answer.generation != 0) {
+		if (answer.generation == generation) {
+			return answer.clamped;
+		}
+		// Memory was mapped or unmapped since: only a change inside the range alters the answer.
+		const auto end = UINT64_MAX - vaddr < size ? UINT64_MAX : vaddr + size;
+		if (g_virtual_ranges->CoverageUnchanged(answer.generation, generation, vaddr, end)) {
+			answer.generation = generation;
+			return answer.clamped;
+		}
 	}
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
 	answer                  = {generation, vaddr, size, clamped_size};

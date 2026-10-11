@@ -31,6 +31,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -417,6 +418,7 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
+	KYTY_PROFILER_FUNCTION();
 	if (ShaderRecompiler::IR::FindBinding(input.stage.program->bindings,
 	        ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory) == nullptr) {
 		return;
@@ -722,8 +724,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	input_info.dispatch_thread_dimensions   = use_thread_dimensions;
 	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	ShaderProgram compute_program;
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::GetComputeProgram");
+		compute_program = m_context.GetPipelineCache().GetComputeProgram(
+		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	}
 	if (!compute_program) {
 		LogSkippedDispatch(cs_regs, "indirect");
 		ResetBindings();
@@ -734,7 +740,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    m_context.GetGraphics(), m_context.GetCommandScheduler());
 	}
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = [&]() -> auto& {
+		KYTY_PROFILER_BLOCK("Dispatch::GetComputePipeline");
+		return m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	}();
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
@@ -750,7 +759,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	RebindBuffers(bindings);
-	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
+	std::optional<DispatchBufferRecovery> recovery_holder;
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::Recovery");
+		recovery_holder.emplace(m_context, bindings, cs_regs.cs_regs.data_addr);
+	}
+	auto& recovery = *recovery_holder;
 	do {
 		RebindImages(bindings);
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
@@ -765,6 +779,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			    std::max(cs_regs.cs_regs.num_thread_x, 1u),
 			    std::max(cs_regs.cs_regs.num_thread_y, 1u),
 			    std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+			KYTY_PROFILER_BLOCK("DispatchIndirect::ConvertGroups");
 			const auto converted = m_indirect_groups->Convert(
 			    buffer.Recorder(), args_buffer->BufferDeviceAddress() + args_offset, local_size);
 			indirect_buffer = converted.groups_buffer;
@@ -781,6 +796,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
+		KYTY_PROFILER_BLOCK("DispatchIndirect::Record");
 		const auto vk_buffer = buffer.Recorder();
 		const bool has_storage_writes =
 		    bindings.shared_memory.buffer != nullptr || HasShaderBufferWrites(input_info.stage) ||

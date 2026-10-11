@@ -1,3 +1,4 @@
+#include "common/profiler.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
@@ -186,6 +187,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	KYTY_PROFILER_FUNCTION();
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
