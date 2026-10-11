@@ -41,6 +41,10 @@ void AddGameReadbackWait(double seconds);
 // waits cost most) and whether it was writing.
 // The shader (0: none bound, a command-processor write) that last wrote GPU data into each 1 MB
 // region, named beside the regions the game waits on (Perf readbacks).
+// The size of the target a draw renders into (KYTY_PERF): the game's internal resolution.
+// Read-only dispatches recorded without their closing barrier (KYTY_READONLY_DISPATCH_BARRIER=0).
+void AddSkippedDispatchBarrier();
+void AddDrawTarget(uint32_t width, uint32_t height);
 void NoteGpuWrite(uint64_t address, uint64_t size, uint64_t shader_hash);
 void AddGameReadbackWait(double seconds, uint64_t address, bool write);
 

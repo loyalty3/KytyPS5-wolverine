@@ -50,6 +50,20 @@
 
 namespace Libs::Graphics {
 
+// Experiment (KYTY_READONLY_DISPATCH_BARRIER=0): a dispatch that writes nothing ends without the
+// full barrier that orders it before every later command. That barrier only keeps a later
+// command from overwriting what the dispatch still reads; with the GPU idle ~7.5 ms a frame
+// between commands (2026-10-11), this measures what the barriers cost. Wrong rendering is
+// possible with it off; nothing else changes.
+static bool ReadOnlyDispatchBarrier() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READONLY_DISPATCH_BARRIER");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+
 // KYTY_LOG_SKIPPED_DISPATCHES=<n>: log the first n dispatches of compute shaders that gave up,
 // with their user data, to see which guest buffers they would have written.
 static bool EarlyDispatchSkip() {
@@ -695,7 +709,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                   (thread_group_y << 16u) | thread_group_z);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (has_storage_writes || ReadOnlyDispatchBarrier()) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		} else {
+			PerfMonitor::AddSkippedDispatchBarrier();
+		}
 	} while (recovery.Retry());
 	ResetBindings();
 }
@@ -824,7 +842,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (has_storage_writes || ReadOnlyDispatchBarrier()) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		} else {
+			PerfMonitor::AddSkippedDispatchBarrier();
+		}
 	} while (recovery.Retry());
 	ResetBindings();
 }

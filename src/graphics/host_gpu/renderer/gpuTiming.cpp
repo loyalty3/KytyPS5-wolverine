@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
@@ -53,6 +54,14 @@ struct State {
 	std::mutex                           stats_mutex;
 	std::unordered_map<uint64_t, Stat>   stats; // key 0: GPU time between timed commands
 	double                               total_ms = 0.0;
+	// The frame's first and last stamps across all its submissions (wall: idle included).
+	uint64_t                             wall_first = UINT64_MAX;
+	uint64_t                             wall_last  = 0;
+	// The whole window, for the summary printed when it ends.
+	std::unordered_map<uint64_t, Stat>   window_stats;
+	double                               window_span_ms = 0.0;
+	double                               window_wall_ms = 0.0;
+	uint64_t                             window_frames  = 0;
 };
 
 State& GetState() {
@@ -110,6 +119,8 @@ void ReadBlock(State& state, Block& block) {
 				const auto last  = values[block.pairs.back().after];
 				if (last >= first) {
 					state.total_ms += static_cast<double>(last - first) * state.period_ns / 1e6;
+					state.wall_first = std::min(state.wall_first, first);
+					state.wall_last  = std::max(state.wall_last, last);
 				}
 			}
 		}
@@ -196,6 +207,40 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 
 } // namespace Detail
 
+namespace {
+
+// Printed to the console (KYTY_PERF logs) and the log: the console needs no full log.
+template <typename... Args>
+void Report(const char* format, Args... args) {
+	std::printf(format, args...);
+	LOGF(format, args...);
+}
+
+const char* KindName(uint64_t key, uint32_t kind) {
+	return key == 0 ? "between " : (kind == Draw ? "draw    " : "dispatch");
+}
+
+void PrintTable(const std::vector<std::pair<uint64_t, Stat>>& sorted, double frames,
+                size_t shown) {
+	double rest       = 0.0;
+	size_t rest_count = 0;
+	for (size_t i = 0; i < sorted.size(); i++) {
+		const auto& [key, stat] = sorted[i];
+		if (i < shown) {
+			Report("GpuTiming   %s 0x%016" PRIx64 " %7.2fms x%.1f\n", KindName(key, stat.kind), key,
+			       stat.ms / frames, static_cast<double>(stat.count) / frames);
+		} else {
+			rest += stat.ms;
+			rest_count++;
+		}
+	}
+	if (rest_count != 0) {
+		Report("GpuTiming   %zu more shaders %7.2fms\n", rest_count, rest / frames);
+	}
+}
+
+} // namespace
+
 void Present(uint64_t frame) {
 	const auto& window = GetWindow();
 	if (window.count == 0) {
@@ -204,31 +249,63 @@ void Present(uint64_t frame) {
 	auto& state = GetState();
 	if (Detail::g_active.load(std::memory_order_relaxed)) {
 		std::vector<std::pair<uint64_t, Stat>> sorted;
-		double                                 timed = 0.0;
 		double                                 total = 0.0;
+		double                                 wall  = 0.0;
 		{
 			std::lock_guard lock(state.stats_mutex);
 			sorted.assign(state.stats.begin(), state.stats.end());
+			for (const auto& [key, stat]: state.stats) {
+				auto& sum = state.window_stats[key];
+				sum.ms += stat.ms;
+				sum.count += stat.count;
+				sum.kind = stat.kind;
+			}
 			state.stats.clear();
 			total          = state.total_ms;
 			state.total_ms = 0.0;
+			if (state.wall_last > state.wall_first) {
+				wall = static_cast<double>(state.wall_last - state.wall_first) * state.period_ns / 1e6;
+			}
+			state.wall_first = UINT64_MAX;
+			state.wall_last  = 0;
+			state.window_span_ms += total;
+			state.window_wall_ms += wall;
+			state.window_frames++;
 		}
 		std::sort(sorted.begin(), sorted.end(),
 		          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+		double draws = 0.0, dispatches = 0.0, between = 0.0;
 		for (const auto& [key, stat]: sorted) {
-			if (key != 0) {
-				timed += stat.ms;
-			}
+			(key == 0 ? between : (stat.kind == Draw ? draws : dispatches)) += stat.ms;
 		}
-		LOGF("GpuTiming frame %" PRIu64 ": span=%.1fms commands=%.1fms\n", frame, total, timed);
-		for (size_t i = 0; i < sorted.size() && i < 20; i++) {
-			const auto& [key, stat] = sorted[i];
-			LOGF("GpuTiming   %s 0x%016" PRIx64 " %7.2fms x%" PRIu64 "\n",
-			     key == 0 ? "between " : (stat.kind == Draw ? "draw    " : "dispatch"), key,
-			     stat.ms, stat.count);
-		}
+		Report("GpuTiming frame %" PRIu64 ": span=%.1fms wall=%.1fms | draws %.1fms, dispatches "
+		       "%.1fms, between commands %.1fms | %zu shaders\n",
+		       frame, total, wall, draws, dispatches, between, sorted.size());
+		PrintTable(sorted, 1.0, 12);
 	}
 	const bool active = frame >= window.first && frame - window.first < window.count;
+	if (!active && Detail::g_active.load(std::memory_order_relaxed) && state.window_frames != 0) {
+		// The window ended: its averages, and every shader by GPU time per frame.
+		std::vector<std::pair<uint64_t, Stat>> sorted;
+		double                                 frames = 0.0;
+		{
+			std::lock_guard lock(state.stats_mutex);
+			sorted.assign(state.window_stats.begin(), state.window_stats.end());
+			frames = static_cast<double>(state.window_frames);
+		}
+		std::sort(sorted.begin(), sorted.end(),
+		          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+		double draws = 0.0, dispatches = 0.0, between = 0.0;
+		for (const auto& [key, stat]: sorted) {
+			(key == 0 ? between : (stat.kind == Draw ? draws : dispatches)) += stat.ms;
+		}
+		Report("GpuTiming summary over %.0f frames: span %.1fms, wall %.1fms per frame | draws "
+		       "%.1fms, dispatches %.1fms, between commands %.1fms | %zu shaders\n",
+		       frames, state.window_span_ms / frames, state.window_wall_ms / frames, draws / frames,
+		       dispatches / frames, between / frames, sorted.size());
+		PrintTable(sorted, frames, 60);
+		std::fflush(stdout);
+	}
 	Detail::g_active.store(active, std::memory_order_relaxed);
 }
 

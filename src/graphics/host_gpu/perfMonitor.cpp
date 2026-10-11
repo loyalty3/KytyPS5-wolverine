@@ -118,6 +118,8 @@ struct ReadbackRegion {
 };
 std::mutex                  g_readback_mutex;
 std::vector<ReadbackRegion> g_readback_regions;
+std::mutex                             g_target_mutex;
+std::unordered_map<uint64_t, uint64_t> g_draw_targets; // width << 32 | height -> draws
 std::mutex                             g_writer_mutex;
 std::unordered_map<uint64_t, uint64_t> g_region_writers; // 1 MB region -> last shader
 
@@ -158,7 +160,7 @@ void Initialize(GraphicContext* graphics) {
 	// The draw, dispatch, wait and readback counters (Profiler::Add) count only while this is on.
 	Profiler::g_counters = true;
 	g_window_start       = Clock::now();
-	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 14), a report every %.0f s\n", KYTY_BUILD_LABEL,
+	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 15), a report every %.0f s\n", KYTY_BUILD_LABEL,
 	            kReportSeconds);
 	std::fflush(stdout);
 }
@@ -189,6 +191,20 @@ void AddGameReadbackWait(double seconds) {
 	while (ns > max &&
 	       !g_readback_max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
 	}
+}
+
+std::atomic<uint64_t> g_skipped_dispatch_barriers {0};
+
+void AddSkippedDispatchBarrier() {
+	g_skipped_dispatch_barriers.fetch_add(1, std::memory_order_relaxed);
+}
+
+void AddDrawTarget(uint32_t width, uint32_t height) {
+	if (!g_enabled) {
+		return;
+	}
+	std::scoped_lock lock(g_target_mutex);
+	g_draw_targets[(static_cast<uint64_t>(width) << 32u) | height]++;
 }
 
 void NoteGpuWrite(uint64_t address, uint64_t size, uint64_t shader_hash) {
@@ -476,6 +492,35 @@ void Tick() {
 				}
 			}
 			std::printf(" %zu regions in all\n", regions.size());
+		}
+	}
+	{
+		std::vector<std::pair<uint64_t, uint64_t>> targets;
+		{
+			std::scoped_lock lock(g_target_mutex);
+			targets.assign(g_draw_targets.begin(), g_draw_targets.end());
+			g_draw_targets.clear();
+		}
+		std::sort(targets.begin(), targets.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		if (!targets.empty()) {
+			uint64_t largest = 0;
+			for (const auto& [size, draws]: targets) {
+				(void)draws;
+				const auto pixels = (size >> 32u) * (size & 0xffffffffu);
+				if (pixels > (largest >> 32u) * (largest & 0xffffffffu)) {
+					largest = size;
+				}
+			}
+			std::printf("Perf targets (draws by render target size; read-only dispatches without a "
+			            "closing barrier %" PRIu64 "): largest %" PRIu64 "x%" PRIu64 " |",
+			            g_skipped_dispatch_barriers.exchange(0, std::memory_order_relaxed),
+			            largest >> 32u, largest & 0xffffffffu);
+			for (size_t i = 0; i < std::min<size_t>(targets.size(), 8); i++) {
+				std::printf(" %" PRIu64 "x%" PRIu64 " %" PRIu64 ";", targets[i].first >> 32u,
+				            targets[i].first & 0xffffffffu, targets[i].second);
+			}
+			std::printf("\n");
 		}
 	}
 	if (Profiler::g_perf_zones) {

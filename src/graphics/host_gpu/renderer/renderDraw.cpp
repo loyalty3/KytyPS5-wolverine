@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/perfMonitor.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -1295,6 +1296,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		return;
 	}
 	auto& pipeline = *deferred_pipeline;
+	if (PerfMonitor::Enabled()) {
+		if (state.color_count != 0) {
+			const auto extent = state.color_info[0].Extent();
+			PerfMonitor::AddDrawTarget(extent.width, extent.height);
+		} else {
+			const auto& extent = state.depth_info.desc.info.extent;
+			PerfMonitor::AddDrawTarget(extent.width, extent.height);
+		}
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
