@@ -161,7 +161,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseTag,
 	m_chunk_size       = Common::AlignUp(std::max<uint64_t>(chunk_min, requirements.alignment),
 	                                     requirements.alignment);
 	m_memory_type_bits = requirements.memoryTypeBits;
-	m_chunks.assign(static_cast<size_t>((size + m_chunk_size - 1) / m_chunk_size), nullptr);
+	m_chunks.assign(static_cast<size_t>((size + m_chunk_size - 1) / m_chunk_size), 0);
 	if (static_cast<bool>(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
 		// The address of the whole range, bound or not: unbound pages read as zero.
 		vk::BufferDeviceAddressInfo address_info {};
@@ -180,10 +180,8 @@ Buffer::~Buffer() {
 		if (m_pool != nullptr) {
 			m_graphics->device.destroyCommandPool(m_pool, nullptr);
 		}
-		for (auto* chunk: m_chunks) {
-			if (chunk != nullptr) {
-				vmaFreeMemory(m_graphics->allocator, chunk);
-			}
+		for (const auto& slab: m_slabs) {
+			vmaFreeMemory(m_graphics->allocator, slab.allocation);
 		}
 		return;
 	}
@@ -214,7 +212,7 @@ void Buffer::MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> r
 		const auto first = offset / m_chunk_size;
 		const auto last  = (offset + size - 1) / m_chunk_size;
 		for (auto chunk = first; chunk <= last; ++chunk) {
-			if (m_chunks[chunk] == nullptr) {
+			if (m_chunks[chunk] == 0) {
 				missing.push_back(chunk);
 			}
 		}
@@ -238,36 +236,48 @@ void Buffer::MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> r
 	for (const auto chunk: missing) {
 		const auto start  = chunk * m_chunk_size;
 		const auto length = std::min(m_chunk_size, m_size - start);
-		VkMemoryRequirements requirements {};
-		requirements.size           = length;
-		requirements.alignment      = m_chunk_size;
-		requirements.memoryTypeBits = m_memory_type_bits;
-		VmaAllocationCreateInfo create {};
-		create.flags         = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-		create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		VmaAllocation     allocation = nullptr;
-		VmaAllocationInfo info {};
-		auto result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
-		if (result != VK_SUCCESS) {
-			// Video memory is over budget: any type the buffer takes, as dense buffers spill.
-			create.flags         = 0;
-			create.requiredFlags = 0;
-			create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-			result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
+		if (m_slabs.empty() || m_slabs.back().used + m_chunk_size > m_slabs.back().size) {
+			constexpr uint64_t SlabBytes = 2ull << 20u;
+			const auto         slab_size = Common::AlignUp(std::max(SlabBytes, m_chunk_size), m_chunk_size);
+			VkMemoryRequirements requirements {};
+			requirements.size           = slab_size;
+			requirements.alignment      = m_chunk_size;
+			requirements.memoryTypeBits = m_memory_type_bits;
+			VmaAllocationCreateInfo create {};
+			create.flags         = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+			create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+			VmaAllocation     allocation = nullptr;
+			VmaAllocationInfo info {};
+			auto result =
+			    vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
+			if (result != VK_SUCCESS) {
+				// Over budget: the card past its budget (the driver may page), as dense buffers do.
+				create.flags = 0;
+				result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
+			}
+			if (result != VK_SUCCESS) {
+				// Then any memory type the buffer takes.
+				create.requiredFlags  = 0;
+				create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+				result = vmaAllocateMemory(graphics.allocator, &requirements, &create, &allocation, &info);
+			}
+			if (result != VK_SUCCESS) {
+				graphics.LogMemoryBudget();
+				EXIT("Out of memory: %" PRIu64 " KB of video memory for a sparse buffer (%s).\n",
+				     slab_size >> 10u, vk::to_string(static_cast<vk::Result>(result)).c_str());
+			}
+			m_slabs.push_back({allocation, info.deviceMemory, info.offset, slab_size, 0});
 		}
-		if (result != VK_SUCCESS) {
-			graphics.LogMemoryBudget();
-			EXIT("Out of memory: %" PRIu64 " KB of video memory for a sparse buffer (%s).\n",
-			     length >> 10u, vk::to_string(static_cast<vk::Result>(result)).c_str());
-		}
-		m_chunks[chunk] = allocation;
-		m_resident_bytes += length;
+		auto& slab = m_slabs.back();
 		vk::SparseMemoryBind bind {};
 		bind.resourceOffset = start;
 		bind.size           = length;
-		bind.memory         = info.deviceMemory;
-		bind.memoryOffset   = info.offset;
+		bind.memory         = slab.memory;
+		bind.memoryOffset   = slab.offset + slab.used;
+		slab.used += m_chunk_size;
 		binds.push_back(bind);
+		m_chunks[chunk] = 1;
+		m_resident_bytes += length;
 	}
 
 	vk::SparseBufferMemoryBindInfo buffer_bind {};

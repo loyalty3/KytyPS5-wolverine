@@ -60,7 +60,7 @@ public:
 	void MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 	// Sparse: whether the chunk holding this offset is bound (dense: always).
 	[[nodiscard]] bool     IsResident(uint64_t offset) const noexcept {
-		return !m_sparse || m_chunks[offset / m_chunk_size] != nullptr;
+		return !m_sparse || m_chunks[offset / m_chunk_size] != 0;
 	}
 	[[nodiscard]] uint64_t ChunkSize() const noexcept { return m_sparse ? m_chunk_size : m_size; }
 	// Bytes bound so far (sparse), or the whole size (dense).
@@ -123,7 +123,18 @@ private:
 	bool                          m_sparse          = false;
 	uint64_t                      m_chunk_size      = 0;
 	uint32_t                      m_memory_type_bits = 0;
-	std::vector<VmaAllocation>    m_chunks;
+	std::vector<uint8_t>          m_chunks; // 1 where bound
+	// Memory comes from 2 MB slabs, cut into chunks: one VMA allocation per 64 KB chunk made
+	// 21,000 of them for the geometry pool, and past the budget VMA served each from a memory
+	// object of its own (5,067 objects, 2026-10-11).
+	struct Slab {
+		VmaAllocation   allocation = nullptr;
+		vk::DeviceMemory memory    = nullptr;
+		uint64_t        offset     = 0;
+		uint64_t        size       = 0;
+		uint64_t        used       = 0;
+	};
+	std::vector<Slab>             m_slabs;
 	uint64_t                      m_resident_bytes  = 0;
 	vk::CommandPool               m_pool            = nullptr;
 };

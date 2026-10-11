@@ -166,7 +166,16 @@ uint64_t GraphicContext::MemoryShortfall() const {
 		if (CanReportMemoryUsage()) {
 			const auto budget = GetTotalMemoryBudget();
 			const auto usage  = GetDeviceMemoryUsage();
-			const auto mark   = budget / 10 * 9;
+			// KYTY_VRAM_PRESSURE_PCT (default 95; was 90): the share of the budget past which the
+			// caches collect. At 90 % a 12 GB card's caches freed ~1 GB of textures every 5 s and
+			// made them again moments later, at 8.3-8.8 GB used against Windows' 9.7 GB
+			// (2026-10-11): the scene's own textures were more than the mark.
+			static const uint64_t percent = [] {
+				const char* value = std::getenv("KYTY_VRAM_PRESSURE_PCT");
+				const auto  pct   = value != nullptr ? std::strtoull(value, nullptr, 10) : 95ull;
+				return std::clamp<uint64_t>(pct, 50, 100);
+			}();
+			const auto mark   = budget / 100 * percent;
 			device            = budget != 0 && usage > mark ? usage - mark : 0;
 		}
 		const uint64_t value    = std::max(commit, device);

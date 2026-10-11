@@ -200,6 +200,7 @@ private:
 	Buffer                                             m_gds_buffer;
 	std::unique_ptr<Buffer>                            m_bda_pagetable_buffer;
 	bool                                               m_sparse_all_resident  = false;
+	std::vector<BufferId>                              m_sparse_buffers; // registered sparse mirrors
 	uint64_t                                           m_sparse_skipped_bytes = 0; // KYTY_PERF
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;

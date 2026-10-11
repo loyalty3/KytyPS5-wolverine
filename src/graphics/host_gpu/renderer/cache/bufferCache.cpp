@@ -187,7 +187,12 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
-		m_total_used_memory += buffer.Size();
+		if (buffer.IsSparse()) {
+			// Counted by what backs it (RunGarbageCollector), not its 2.7 GB of address range.
+			m_sparse_buffers.push_back(id);
+		} else {
+			m_total_used_memory += buffer.Size();
+		}
 		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
 		std::vector<vk::DeviceAddress> addresses;
@@ -203,8 +208,12 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
 		m_buffers.erase(found);
-		EXIT_IF(buffer.Size() > m_total_used_memory);
-		m_total_used_memory -= buffer.Size();
+		if (buffer.IsSparse()) {
+			std::erase(m_sparse_buffers, id);
+		} else {
+			EXIT_IF(buffer.Size() > m_total_used_memory);
+			m_total_used_memory -= buffer.Size();
+		}
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer->Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
@@ -1488,6 +1497,11 @@ void BufferCache::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
 	m_gc_tick++;
 	const auto clock = LruClock();
+	// Sparse buffers count by the video memory backing them.
+	uint64_t used = m_total_used_memory;
+	for (const auto sparse_id: m_sparse_buffers) {
+		used += m_slot_buffers[sparse_id].ResidentBytes();
+	}
 	// Memory pressure, as in TextureCache::RunGarbageCollector.
 	if (m_trigger_gc_memory != m_applied_trigger_gc_memory ||
 	    m_critical_gc_memory != m_applied_critical_gc_memory) {
@@ -1496,7 +1510,7 @@ void BufferCache::RunGarbageCollector() {
 	}
 	if (const auto shortfall = m_graphics.MemoryShortfall(); shortfall != 0) {
 		const auto cap = std::max<uint64_t>(
-		    m_total_used_memory > shortfall ? m_total_used_memory - shortfall : 0, 512ull << 20u);
+		    used > shortfall ? used - shortfall : 0, 512ull << 20u);
 		m_trigger_gc_memory  = std::min(m_base_trigger_gc_memory, cap);
 		m_critical_gc_memory = std::min(m_base_critical_gc_memory, cap + cap / 8);
 	} else {
@@ -1515,7 +1529,7 @@ void BufferCache::RunGarbageCollector() {
 	}
 	if (PerfMonitor::SnapshotDueBuffer()) {
 		PerfMonitor::BufferSnapshot snapshot {.buffers      = m_buffers.size(),
-		                                      .total_bytes  = m_total_used_memory,
+		                                      .total_bytes  = used,
 		                                      .trigger_mark = m_trigger_gc_memory,
 		                                      .pagetable_bytes  = m_bda_pagetable_buffer->ResidentBytes(),
 		                                      .pagetable_sparse = m_bda_pagetable_buffer->IsSparse()};
@@ -1538,11 +1552,11 @@ void BufferCache::RunGarbageCollector() {
 		snapshot.sparse_skipped_bytes = std::exchange(m_sparse_skipped_bytes, 0);
 		PerfMonitor::SetBufferSnapshot(snapshot);
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (used < m_trigger_gc_memory) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const bool     aggressive = used >= m_critical_gc_memory;
 	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
 	// never a candidate, whatever the submission count.
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
@@ -1559,6 +1573,13 @@ void BufferCache::RunGarbageCollector() {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
 		gc_visited++;
+		if (buffer.IsSparse()) {
+			// A whole-heap mirror (the geometry pool) is in use whenever the scene is drawn, and
+			// mirroring it again reads and uploads all of it: the collector freed Wolverine's
+			// 2.7 GB pool under pressure and its rebuild froze the game for 5-10 s, three times in
+			// one session (2026-10-11).
+			return false;
+		}
 		if (buffer.CpuAddress() == 0) {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
