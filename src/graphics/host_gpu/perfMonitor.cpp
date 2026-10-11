@@ -3,6 +3,17 @@
 #include "common/profiler.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vulkanCommon.h"
+#include "kytyGitVersion.h"
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnullability-completeness"
+#endif
+#include <vk_mem_alloc.h>
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #include <algorithm>
 #include <array>
@@ -11,6 +22,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 
 namespace Libs::Graphics::PerfMonitor {
 
@@ -29,6 +41,14 @@ std::atomic<int64_t>  g_blocked_ns {0};
 std::atomic<int64_t>  g_readback_ns {0};
 std::atomic<int64_t>  g_readback_max_ns {0};
 std::atomic<uint64_t> g_frames {0};
+
+std::atomic<bool>  g_tex_due {false};
+std::atomic<bool>  g_buf_due {false};
+std::mutex         g_snapshot_mutex;
+TextureSnapshot    g_tex_snapshot {};
+BufferSnapshot     g_buf_snapshot {};
+bool               g_tex_valid = false;
+bool               g_buf_valid = false;
 
 // Owned by the GPU thread (Tick).
 Clock::time_point g_window_start {};
@@ -65,7 +85,8 @@ void Initialize(GraphicContext* graphics) {
 	// The draw, dispatch, wait and readback counters (Profiler::Add) count only while this is on.
 	Profiler::g_counters = true;
 	g_window_start       = Clock::now();
-	std::printf("Perf: KYTY_PERF on, a report every %.0f s\n", kReportSeconds);
+	std::printf("Perf: KYTY_PERF on (%s, JEEVES patch 2), a report every %.0f s\n", KYTY_BUILD_LABEL,
+	            kReportSeconds);
 	std::fflush(stdout);
 }
 
@@ -101,6 +122,26 @@ void FramePresented() {
 	if (g_enabled) {
 		g_frames.fetch_add(1, std::memory_order_relaxed);
 	}
+}
+
+bool SnapshotDueTexture() {
+	return g_enabled && g_tex_due.exchange(false, std::memory_order_relaxed);
+}
+
+bool SnapshotDueBuffer() {
+	return g_enabled && g_buf_due.exchange(false, std::memory_order_relaxed);
+}
+
+void SetTextureSnapshot(const TextureSnapshot& snapshot) {
+	std::scoped_lock lock(g_snapshot_mutex);
+	g_tex_snapshot = snapshot;
+	g_tex_valid    = true;
+}
+
+void SetBufferSnapshot(const BufferSnapshot& snapshot) {
+	std::scoped_lock lock(g_snapshot_mutex);
+	g_buf_snapshot = snapshot;
+	g_buf_valid    = true;
 }
 
 void Tick() {
@@ -157,6 +198,25 @@ void Tick() {
 		vram_used   = g_graphics->GetDeviceMemoryUsage() >> 20u;
 		vram_budget = g_graphics->GetTotalMemoryBudget() >> 20u;
 	}
+	// Per heap: device-local (the card's own memory) against the budget Windows grants this
+	// process, and what sits in system-memory heaps (spilled buffers and images: every GPU access
+	// to them crosses PCIe).
+	uint64_t card_used = 0, card_budget = 0, system_used = 0;
+	if (g_graphics != nullptr && g_graphics->allocator != nullptr && g_graphics->CanReportMemoryUsage()) {
+		VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+		vmaGetHeapBudgets(g_graphics->allocator, budgets);
+		const auto& properties = g_graphics->GetPhysicalDeviceMemoryProperties();
+		for (uint32_t heap = 0; heap < properties.memoryHeapCount; heap++) {
+			const bool local = static_cast<bool>(properties.memoryHeaps[heap].flags &
+			                                     vk::MemoryHeapFlagBits::eDeviceLocal);
+			if (local) {
+				card_used += budgets[heap].usage;
+				card_budget += budgets[heap].budget;
+			} else {
+				system_used += budgets[heap].statistics.blockBytes;
+			}
+		}
+	}
 	uint64_t commit_limit = 0;
 	uint64_t commit_free  = 0;
 	Common::VirtualMemory::QueryCommit(commit_limit, commit_free);
@@ -178,7 +238,27 @@ void Tick() {
 	    static_cast<double>(pipeline_us) / 1000.0, skipped_pipeline, skipped_list, skipped_gave_up,
 	    drains, created, destroyed,
 	    Profiler::Connected() ? " (Tracy connected: counters unreliable)" : "");
+	{
+		std::scoped_lock lock(g_snapshot_mutex);
+		if (g_tex_valid || g_buf_valid) {
+			std::printf("Perf mem: card %" PRIu64 "/%" PRIu64 " MB (Windows budget), emulator data in system memory %" PRIu64
+			            " MB | ",
+			            card_used >> 20u, card_budget >> 20u, system_used >> 20u);
+			std::printf("textures %" PRIu64 " MB in %" PRIu64 " images (heap-pinned %" PRIu64
+			            " MB, targets %" PRIu64 " MB, GPU-written %" PRIu64
+			            " MB; collector mark %" PRIu64 " MB) | buffers %" PRIu64 " MB in %" PRIu64
+			            " (collector mark %" PRIu64 " MB)\n",
+			            g_tex_snapshot.total_bytes >> 20u, g_tex_snapshot.images,
+			            g_tex_snapshot.pinned_bytes >> 20u, g_tex_snapshot.target_bytes >> 20u,
+			            g_tex_snapshot.gpu_bytes >> 20u, g_tex_snapshot.pressure_mark >> 20u,
+			            g_buf_snapshot.total_bytes >> 20u, g_buf_snapshot.buffers,
+			            g_buf_snapshot.trigger_mark >> 20u);
+		}
+	}
 	std::fflush(stdout);
+	// Ask both caches for a fresh snapshot for the next report.
+	g_tex_due.store(true, std::memory_order_relaxed);
+	g_buf_due.store(true, std::memory_order_relaxed);
 }
 
 } // namespace Libs::Graphics::PerfMonitor

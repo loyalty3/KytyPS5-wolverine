@@ -1382,6 +1382,11 @@ void BufferCache::RunGarbageCollector() {
 	if (device_bytes && m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	if (PerfMonitor::SnapshotDueBuffer()) {
+		PerfMonitor::SetBufferSnapshot({.buffers      = m_buffers.size(),
+		                                .total_bytes  = m_total_used_memory,
+		                                .trigger_mark = m_trigger_gc_memory});
+	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}

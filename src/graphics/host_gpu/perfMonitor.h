@@ -41,6 +41,26 @@ void FramePresented();
 // Prints the report when 5 seconds have passed. Called by the GPU thread once per loop.
 void Tick();
 
+// What the texture and buffer caches hold, for the next report: each report asks for a fresh
+// snapshot (SnapshotDue returns true once per report and cache), the cache's collector answers.
+struct TextureSnapshot {
+	uint64_t images        = 0;
+	uint64_t total_bytes   = 0; // every registered image
+	uint64_t pinned_bytes  = 0; // bindless-pinned: the guest's texture heaps refer to them
+	uint64_t target_bytes  = 0; // bound as a render or depth target
+	uint64_t gpu_bytes     = 0; // written by the GPU (kept until written back)
+	uint64_t pressure_mark = 0; // the collector's pressure threshold (collectable bytes)
+};
+struct BufferSnapshot {
+	uint64_t buffers      = 0;
+	uint64_t total_bytes  = 0;
+	uint64_t trigger_mark = 0;
+};
+bool SnapshotDueTexture();
+bool SnapshotDueBuffer();
+void SetTextureSnapshot(const TextureSnapshot& snapshot);
+void SetBufferSnapshot(const BufferSnapshot& snapshot);
+
 } // namespace PerfMonitor
 
 } // namespace Libs::Graphics

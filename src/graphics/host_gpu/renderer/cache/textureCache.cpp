@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/perfMonitor.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -2341,6 +2342,28 @@ void TextureCache::RunGarbageCollector() {
 				m_pinned_bytes += image.AccountedSize();
 			}
 		});
+	}
+	if (PerfMonitor::SnapshotDueTexture()) {
+		PerfMonitor::TextureSnapshot snapshot;
+		snapshot.pressure_mark = m_pressure_gc_memory;
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			if (!image.registered) {
+				return;
+			}
+			const auto size = image.AccountedSize();
+			snapshot.images++;
+			snapshot.total_bytes += size;
+			if (image.bindless_pinned) {
+				snapshot.pinned_bytes += size;
+			}
+			if (image.binding.is_target || image.usage.render_target || image.usage.depth_target) {
+				snapshot.target_bytes += size;
+			}
+			if (image.IsGpuModified()) {
+				snapshot.gpu_bytes += size;
+			}
+		});
+		PerfMonitor::SetTextureSnapshot(snapshot);
 	}
 	if (CollectableMemory() < m_trigger_gc_memory) {
 		return;
