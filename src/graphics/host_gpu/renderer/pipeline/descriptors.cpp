@@ -2226,6 +2226,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
 		if (stage->runtime->program->has_address_writes) {
+			m_context.GetBufferCache().MakeSparseBuffersResident();
 			PerfMonitor::AddAddressWriteShader();
 		}
 	}

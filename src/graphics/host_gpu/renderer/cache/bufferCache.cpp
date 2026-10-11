@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -62,11 +63,101 @@ std::unique_ptr<Buffer> BufferCache::MakePageTable(GraphicContext& graphics,
                                                    CommandScheduler& scheduler) {
 	if (graphics.sparse_buffer_enabled) {
 		// No device address: the table is bound as a storage buffer only.
-		return std::make_unique<Buffer>(graphics, scheduler, Buffer::SparseTag {},
-		                                AllFlags, BDA_PAGETABLE_SIZE);
+		// Bound 1 MB at a time: 1 MB of table covers 2 GiB of guest addresses (16 KB pages, 8
+		// bytes each), so a title binds a few dozen pieces over a session.
+		return std::make_unique<Buffer>(graphics, scheduler, Buffer::SparseTag {}, 0, AllFlags,
+		                                BDA_PAGETABLE_SIZE, MiB);
 	}
 	return std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
 	                                BDA_PAGETABLE_SIZE);
+}
+
+namespace {
+// KYTY_SPARSE_BUFFER_MB (default 1024; 0 = off): a mirror at least this large is a sparse buffer
+// that gets video memory only where the guest's bytes are not all zero, 64 KB at a time.
+// Wolverine binds its whole 2.7 GB geometry pool (CommitIABufferAllocator) as one descriptor,
+// and 1.5 GB of it held only zeros (2026-10-11): unbacked, those read as zero just the same.
+// Every GPU write into the buffer binds its range first; a shader that stores through guest
+// pointers (none seen in Wolverine) binds all of it, as the dense buffer was.
+uint64_t SparseBufferBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_SPARSE_BUFFER_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) << 20u;
+	}();
+	return bytes;
+}
+constexpr uint64_t SparseBufferChunk = 64 * 1024;
+
+bool AllZero(const uint8_t* data, uint64_t size) {
+	uint64_t i = 0;
+	for (; i + 8 <= size; i += 8) {
+		uint64_t word = 0;
+		std::memcpy(&word, data + i, 8);
+		if (word != 0) {
+			return false;
+		}
+	}
+	for (; i < size; i++) {
+		if (data[i] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+} // namespace
+
+// Upload copies into a sparse buffer: a piece that lands in an unbound chunk and holds only zeros
+// is dropped (unbound memory reads as zero); the chunks the rest lands in are bound first. data
+// points at the staged bytes of the copy whose srcOffset is bias.
+void BufferCache::FilterSparseCopies(Buffer& buffer, const uint8_t* data, uint64_t bias,
+                                     std::vector<vk::BufferCopy>& copies) {
+	const auto chunk = buffer.ChunkSize();
+	std::vector<vk::BufferCopy>                 kept;
+	std::vector<std::pair<uint64_t, uint64_t>> bind;
+	kept.reserve(copies.size());
+	for (const auto& copy: copies) {
+		uint64_t done = 0;
+		while (done < copy.size) {
+			const auto destination = copy.dstOffset + done;
+			const auto length      = std::min(copy.size - done, chunk - destination % chunk);
+			const auto source      = copy.srcOffset + done;
+			const bool resident    = buffer.IsResident(destination);
+			if (resident || !AllZero(data + (source - bias), length)) {
+				if (!kept.empty() && kept.back().srcOffset + kept.back().size == source &&
+				    kept.back().dstOffset + kept.back().size == destination) {
+					kept.back().size += length;
+				} else {
+					kept.push_back({source, destination, length});
+				}
+				if (!resident) {
+					bind.emplace_back(destination, length);
+				}
+			} else {
+				m_sparse_skipped_bytes += length;
+			}
+			done += length;
+		}
+	}
+	buffer.MakeResidentRanges(bind);
+	copies.swap(kept);
+}
+
+void BufferCache::MakeSparseBuffersResident() {
+	if (m_sparse_all_resident) {
+		return;
+	}
+	m_sparse_all_resident = true;
+	for (const auto& [address, id]: m_buffers) {
+		(void)address;
+		auto& buffer = m_slot_buffers[id];
+		if (buffer.IsSparse()) {
+			buffer.MakeResident(0, buffer.Size());
+		}
+	}
+	std::printf("BufferCache: a shader stores through guest pointers; sparse buffers are now fully "
+	            "backed\n");
+	LOGF("BufferCache: a shader stores through guest pointers; sparse buffers are now fully "
+	     "backed\n");
 }
 
 void BufferCache::Register(BufferId id) {
@@ -703,6 +794,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	new_buffer.MakeResident(overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
@@ -743,10 +835,19 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 			     overlap.has_stream_leap ? 1 : 0);
 		}
 	}
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
-	const auto& buffer = m_slot_buffers[id];
+	const auto mirror_size = overlap.end - overlap.begin;
+	const bool sparse = m_graphics.sparse_buffer_enabled && SparseBufferBytes() != 0 &&
+	                    mirror_size >= SparseBufferBytes() && !m_sparse_all_resident;
+	const auto id = sparse
+	                    ? m_slot_buffers.insert(m_graphics, m_scheduler, Buffer::SparseTag {},
+	                                            overlap.begin,
+	                                            AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+	                                            mirror_size, SparseBufferChunk)
+	                    : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
+	                                            overlap.begin,
+	                                            AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+	                                            mirror_size);
+	auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
@@ -876,7 +977,7 @@ static void ReadGuestForUpload(uint8_t* destination, uint64_t address, uint64_t 
 	}
 }
 
-vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::vector<vk::BufferCopy>& copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
 		return nullptr;
@@ -898,7 +999,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			const char* value = std::getenv("KYTY_UPLOAD_READS_ON_RECORD_THREAD");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (deferred && m_staging_buffer.IsCoherent() && m_scheduler.Current().Recorder().Threaded()) {
+		if (deferred && !buffer.IsSparse() && m_staging_buffer.IsCoherent() &&
+		    m_scheduler.Current().Recorder().Threaded()) {
 			m_upload_reads.clear();
 			for (auto& copy: copies) {
 				m_upload_reads.push_back(
@@ -921,6 +1023,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
+		if (buffer.IsSparse()) {
+			FilterSparseCopies(buffer, mapped, base_offset, copies);
+			if (copies.empty()) {
+				return nullptr;
+			}
+		}
 		return m_staging_buffer.Handle();
 	}
 
@@ -932,7 +1040,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		ReadGuestForUpload(temporary->Mapped().data() + copy.srcOffset, address, copy.size);
 	}
 	temporary->Flush(0, total_size);
-	const auto handle = temporary->Handle();
+	if (buffer.IsSparse()) {
+		FilterSparseCopies(buffer, temporary->Mapped().data(), 0, copies);
+	}
+	const auto handle = copies.empty() ? vk::Buffer {} : temporary->Handle();
 	m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return handle;
 }
@@ -965,6 +1076,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
+	if (is_written) {
+		buffer.MakeResident(buffer.Offset(vaddr), size);
+	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		MarkGpuWritten(vaddr, size);
@@ -990,6 +1104,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	// stores can reach become GPU-written.
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 	if (written_size != 0) {
+		buffer.MakeResident(buffer.Offset(written_vaddr), written_size);
 		(void)SynchronizeBuffer(buffer, written_vaddr, written_size, true, false);
 		MarkGpuWritten(written_vaddr, written_size);
 	}
@@ -1047,6 +1162,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, ui
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	buffer.last_use_tick = m_scheduler.CurrentTick();
+	buffer.MakeResident(buffer.Offset(vaddr), size);
 	(void)SynchronizeBuffer(buffer, vaddr, size, true, false);
 	MarkGpuWritten(vaddr, size, true);
 	return {&buffer, buffer.Offset(vaddr)};
@@ -1414,7 +1530,12 @@ void BufferCache::RunGarbageCollector() {
 		snapshot.large_count = std::min(large.size(), PerfMonitor::BufferSnapshot::MaxLarge);
 		for (size_t i = 0; i < snapshot.large_count; i++) {
 			snapshot.large[i] = {large[i].second, large[i].first};
+			const auto* owner = m_page_table.Find(large[i].second >> PageTable::kPageBits);
+			if (owner != nullptr && *owner) {
+				snapshot.large_resident[i] = m_slot_buffers[*owner].ResidentBytes();
+			}
 		}
+		snapshot.sparse_skipped_bytes = std::exchange(m_sparse_skipped_bytes, 0);
 		PerfMonitor::SetBufferSnapshot(snapshot);
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {

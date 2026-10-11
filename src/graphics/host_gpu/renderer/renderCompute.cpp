@@ -586,6 +586,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	FindBuffers(bindings);
 	if (program.has_address_writes) {
+		m_context.GetBufferCache().MakeSparseBuffersResident();
 		PerfMonitor::AddAddressWriteShader();
 	}
 	if (program.info.uses_dma) {
@@ -739,6 +740,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.has_address_writes) {
+		m_context.GetBufferCache().MakeSparseBuffersResident();
 		PerfMonitor::AddAddressWriteShader();
 	}
 	if (program.info.uses_dma) {

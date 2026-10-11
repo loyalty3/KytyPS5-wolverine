@@ -89,6 +89,9 @@ public:
 	[[nodiscard]] Buffer*       GetGdsBuffer() noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return m_bda_pagetable_buffer.get(); }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	// Before a shader that stores through guest pointers runs: sparse buffers drop writes to
+	// unbacked pages, so all of them get backed (once) and no new buffer is made sparse.
+	void MakeSparseBuffersResident();
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	// GPU write bitmap (KYTY_WRITE_BITMAP=1, rework.md Phase 2 first step): one bit per 4 KiB
 	// guest page below 1 TiB, set by shaders through bindings whose writes the host cannot bound.
@@ -174,8 +177,10 @@ private:
 	void                     DeleteBuffer(BufferId id);
 	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                           bool is_written, bool is_texel_buffer);
-	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::vector<vk::BufferCopy>& copies,
 	                                      uint64_t total_size);
+	void FilterSparseCopies(Buffer& buffer, const uint8_t* data, uint64_t bias,
+	                        std::vector<vk::BufferCopy>& copies);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
@@ -194,6 +199,8 @@ private:
 	FaultManager                                       m_fault_manager;
 	Buffer                                             m_gds_buffer;
 	std::unique_ptr<Buffer>                            m_bda_pagetable_buffer;
+	bool                                               m_sparse_all_resident  = false;
+	uint64_t                                           m_sparse_skipped_bytes = 0; // KYTY_PERF
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;

@@ -245,7 +245,16 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		}
 	}
 	if (discrete) {
-		const auto own = budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		// KYTY_VRAM_RESERVE_MB (default 512; was 1024): what is kept back from Windows' budget.
+		// The caches collect at 90 % of what remains. With 1 GB kept back, a 12 GB card's caches
+		// churned ~1 GB of textures every 5 s at 8.4-9.0 GB used, under its 9.75 GB budget, each
+		// texture freed and uploaded again (2026-10-11). Images now free their own memory, so the
+		// usage the budget reports follows what the caches free.
+		static const uint64_t reserve = [] {
+			const char* value = std::getenv("KYTY_VRAM_RESERVE_MB");
+			return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {512}) << 20u;
+		}();
+		const auto own = budget - std::min<uint64_t>(budget / 8, reserve);
 		const auto target = VramTargetBytes();
 		return target != 0 ? std::min(own, target) : own;
 	}

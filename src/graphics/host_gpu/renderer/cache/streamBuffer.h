@@ -43,8 +43,9 @@ public:
 	// Unbound ranges read as zero and drop writes (residencyNonResidentStrict). Needs
 	// GraphicContext::sparse_buffer_enabled.
 	struct SparseTag {};
-	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseTag,
-	       vk::BufferUsageFlags flags, uint64_t size);
+	// chunk_min: the smallest piece bound at a time (rounded up to the device's sparse block).
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseTag, uint64_t cpu_address,
+	       vk::BufferUsageFlags flags, uint64_t size, uint64_t chunk_min);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -55,6 +56,13 @@ public:
 	// zeroes in a command buffer of its own; the one being recorded is not split.
 	// GPU thread only. Memory stays bound until the buffer is destroyed.
 	void MakeResident(uint64_t offset, uint64_t size);
+	// The same for several ranges (offset, size) at once: one wait, one bind.
+	void MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+	// Sparse: whether the chunk holding this offset is bound (dense: always).
+	[[nodiscard]] bool     IsResident(uint64_t offset) const noexcept {
+		return !m_sparse || m_chunks[offset / m_chunk_size] != nullptr;
+	}
+	[[nodiscard]] uint64_t ChunkSize() const noexcept { return m_sparse ? m_chunk_size : m_size; }
 	// Bytes bound so far (sparse), or the whole size (dense).
 	[[nodiscard]] uint64_t ResidentBytes() const noexcept;
 

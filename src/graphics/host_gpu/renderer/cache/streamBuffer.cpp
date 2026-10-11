@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <span>
+#include <utility>
 #include <cinttypes>
 #include <cstring>
 #include <numeric>
@@ -140,18 +142,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
-namespace {
-// Bound per chunk: 1 MB of table covers 2 GiB of guest addresses (16 KB pages, 8 bytes each), so
-// a title binds a few dozen chunks over a session and the GPU drains once per new chunk set.
-constexpr uint64_t SPARSE_CHUNK_MIN = 1ull << 20u;
-} // namespace
-
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseTag,
-               vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, uint64_t chunk_min)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
-      m_size(size), m_sparse(true) {
+      m_cpu_address(cpu_address), m_size(size), m_sparse(true) {
 	EXIT_IF(!graphics.sparse_buffer_enabled || size == 0);
-	EXIT_IF(static_cast<bool>(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress));
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.flags = vk::BufferCreateFlagBits::eSparseBinding |
 	                    vk::BufferCreateFlagBits::eSparseResidency;
@@ -163,10 +158,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, SparseTag,
 	vk::MemoryRequirements requirements {};
 	graphics.device.getBufferMemoryRequirements(m_buffer, &requirements);
 	EXIT_IF(requirements.alignment == 0 || requirements.memoryTypeBits == 0);
-	m_chunk_size       = Common::AlignUp(std::max<uint64_t>(SPARSE_CHUNK_MIN, requirements.alignment),
+	m_chunk_size       = Common::AlignUp(std::max<uint64_t>(chunk_min, requirements.alignment),
 	                                     requirements.alignment);
 	m_memory_type_bits = requirements.memoryTypeBits;
 	m_chunks.assign(static_cast<size_t>((size + m_chunk_size - 1) / m_chunk_size), nullptr);
+	if (static_cast<bool>(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress)) {
+		// The address of the whole range, bound or not: unbound pages read as zero.
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+	}
 }
 
 Buffer::~Buffer() {
@@ -195,21 +197,33 @@ uint64_t Buffer::ResidentBytes() const noexcept {
 }
 
 void Buffer::MakeResident(uint64_t offset, uint64_t size) {
-	if (!m_sparse || size == 0) {
+	const std::pair<uint64_t, uint64_t> range {offset, size};
+	MakeResidentRanges({&range, 1});
+}
+
+void Buffer::MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	if (!m_sparse) {
 		return;
 	}
-	EXIT_IF(offset > m_size || size > m_size - offset);
-	const auto first = offset / m_chunk_size;
-	const auto last  = (offset + size - 1) / m_chunk_size;
 	std::vector<uint64_t> missing;
-	for (auto chunk = first; chunk <= last; ++chunk) {
-		if (m_chunks[chunk] == nullptr) {
-			missing.push_back(chunk);
+	for (const auto& [offset, size]: ranges) {
+		if (size == 0) {
+			continue;
+		}
+		EXIT_IF(offset > m_size || size > m_size - offset);
+		const auto first = offset / m_chunk_size;
+		const auto last  = (offset + size - 1) / m_chunk_size;
+		for (auto chunk = first; chunk <= last; ++chunk) {
+			if (m_chunks[chunk] == nullptr) {
+				missing.push_back(chunk);
+			}
 		}
 	}
 	if (missing.empty()) {
 		return;
 	}
+	std::sort(missing.begin(), missing.end());
+	missing.erase(std::unique(missing.begin(), missing.end()), missing.end());
 	KYTY_PROFILER_FUNCTION();
 	auto& graphics = *m_graphics;
 	// Newly bound memory holds garbage until it is zeroed, and submitted work may read these
@@ -243,7 +257,7 @@ void Buffer::MakeResident(uint64_t offset, uint64_t size) {
 		}
 		if (result != VK_SUCCESS) {
 			graphics.LogMemoryBudget();
-			EXIT("Out of memory: %" PRIu64 " KB for the buffer cache page table (%s).\n",
+			EXIT("Out of memory: %" PRIu64 " KB of video memory for a sparse buffer (%s).\n",
 			     length >> 10u, vk::to_string(static_cast<vk::Result>(result)).c_str());
 		}
 		m_chunks[chunk] = allocation;
@@ -295,8 +309,13 @@ void Buffer::MakeResident(uint64_t offset, uint64_t size) {
 	vk::CommandBufferBeginInfo begin {};
 	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	RequireVulkanSuccess(command.begin(&begin), "begin sparse fill");
-	for (const auto& bind: binds) {
-		command.fillBuffer(m_buffer, bind.resourceOffset, bind.size, 0);
+	for (size_t i = 0; i < binds.size();) {
+		auto begin = binds[i].resourceOffset;
+		auto end   = begin + binds[i].size;
+		for (i++; i < binds.size() && binds[i].resourceOffset == end; i++) {
+			end += binds[i].size;
+		}
+		command.fillBuffer(m_buffer, begin, end - begin, 0);
 	}
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
