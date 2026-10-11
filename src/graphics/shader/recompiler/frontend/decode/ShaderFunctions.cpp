@@ -4,6 +4,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <xxhash.h>
 #include <array>
 #include <cstddef>
 #include <limits>
@@ -651,6 +652,7 @@ struct ShaderFunctionExpander::Impl {
 		bool                  ok = false;
 		std::string           reason;
 		std::vector<uint32_t> code;
+		uint64_t              hash = 0; // XXH3 of code (ExpandShared)
 	};
 	struct Shader {
 		ShaderAnalysis         analysis;
@@ -681,7 +683,25 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
                                     std::string& reason, uint32_t wave_size) {
-	expanded.clear();
+	const std::vector<uint32_t>* shared = nullptr;
+	uint64_t                     hash   = 0;
+	const bool ok = ExpandShared(code, base, user_data, read, shared, hash, reason, wave_size);
+	if (shared != nullptr) {
+		expanded = *shared;
+	} else {
+		expanded.clear();
+	}
+	return ok;
+}
+
+bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64_t base,
+                                          std::span<const uint32_t> user_data,
+                                          const ShaderCodeReader& read,
+                                          const std::vector<uint32_t>*& expanded,
+                                          uint64_t& expanded_hash, std::string& reason,
+                                          uint32_t wave_size) {
+	expanded      = nullptr;
+	expanded_hash = 0;
 	reason.clear();
 	if (wave_size != 32u && wave_size != 64u) {
 		reason = "shader calls require a known wave size";
@@ -708,8 +728,9 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
 		    m_impl->StillReads(expansion, read)) {
-			expanded = expansion.code;
-			reason   = expansion.reason;
+			expanded      = &expansion.code;
+			expanded_hash = expansion.hash;
+			reason        = expansion.reason;
 			return expansion.ok;
 		}
 	}
@@ -727,13 +748,21 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
 	                              wave_size, expansion.code, expansion.reason);
 	MergeReads(expansion.reads);
-	expanded = expansion.code;
-	reason   = expansion.reason;
+	// Never 0 for code, so a zero hash keeps meaning "no expansion".
+	expansion.hash = expansion.code.empty()
+	                     ? 0
+	                     : (XXH3_64bits(expansion.code.data(),
+	                                    expansion.code.size() * sizeof(uint32_t)) |
+	                        1u);
 	if (shader.expansions.size() >= Impl::MaxExpansions) {
 		shader.expansions.erase(shader.expansions.begin());
 	}
 	shader.expansions.push_back(std::move(expansion));
-	return shader.expansions.back().ok;
+	const auto& kept = shader.expansions.back();
+	expanded         = &kept.code;
+	expanded_hash    = kept.hash;
+	reason           = kept.reason;
+	return kept.ok;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

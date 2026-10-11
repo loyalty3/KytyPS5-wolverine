@@ -41,6 +41,12 @@ public:
 	bool Expand(std::span<const uint32_t> code, uint64_t base, std::span<const uint32_t> user_data,
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
 	            uint32_t wave_size);
+	// Expand without the copy: `expanded` points at the kept expansion (null when the shader makes
+	// no calls), valid until the next call; `expanded_hash` is its XXH3, made once per expansion.
+	bool ExpandShared(std::span<const uint32_t> code, uint64_t base,
+	                  std::span<const uint32_t> user_data, const ShaderCodeReader& read,
+	                  const std::vector<uint32_t>*& expanded, uint64_t& expanded_hash,
+	                  std::string& reason, uint32_t wave_size);
 
 private:
 	struct Impl;

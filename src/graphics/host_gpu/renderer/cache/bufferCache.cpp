@@ -1005,6 +1005,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			    total_size += bytes;
 		    },
 		    [&]() noexcept {
+			    // Called on every sync, ~10,000 a frame in combat, nearly all with nothing to
+			    // upload: the zone itself was 4 % of the GPU thread (2026-10-11).
+			    if (copies.empty()) {
+				    return;
+			    }
 			    KYTY_PROFILER_BLOCK("Sync::Upload");
 			    source = UploadCopies(buffer, copies, total_size);
 		    });
