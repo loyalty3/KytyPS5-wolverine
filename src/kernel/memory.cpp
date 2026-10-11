@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -523,6 +524,7 @@ public:
 		if (spans) {
 			const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
 			if (m_spans_generation != generation) {
+				KYTY_PROFILER_BLOCK("ClampRangeSize::RebuildSpans");
 				RebuildSpansUnlocked();
 				m_spans_generation = generation;
 			}
@@ -1122,14 +1124,28 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 			return answer.clamped;
 		}
 		// Memory was mapped or unmapped since: only a change inside the range alters the answer.
+		// The log is walked change by change, so an answer far behind is asked again instead:
+		// while the game unmapped hundreds of textures a second the walks ran to thousands of
+		// entries, 7-18 us a call and up to 36 % of the GPU thread (2026-10-11).
+		constexpr uint64_t kMaxWalk = 128;
 		const auto end = UINT64_MAX - vaddr < size ? UINT64_MAX : vaddr + size;
-		if (g_virtual_ranges->CoverageUnchanged(answer.generation, generation, vaddr, end,
-		                                        answer.clamped == size)) {
+		bool unchanged = false;
+		if (generation - answer.generation <= kMaxWalk) {
+			KYTY_PROFILER_BLOCK("ClampRangeSize::Validate");
+			unchanged = g_virtual_ranges->CoverageUnchanged(answer.generation, generation, vaddr,
+			                                                end, answer.clamped == size);
+		}
+		if (unchanged) {
 			answer.generation = generation;
 			return answer.clamped;
 		}
 	}
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	uint64_t clamped_size = 0;
+	{
+		// Waiting for the lock (the game thread maps and unmaps under it) and the search.
+		KYTY_PROFILER_BLOCK("ClampRangeSize::Ask");
+		clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	}
 	answer                  = {generation, vaddr, size, clamped_size};
 	if (clamped_size != 0 && clamped_size != size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64

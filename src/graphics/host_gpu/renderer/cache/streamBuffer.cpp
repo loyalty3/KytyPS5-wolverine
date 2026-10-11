@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <span>
 #include <utility>
 #include <cinttypes>
@@ -343,6 +344,8 @@ void Buffer::WaitSubmitted() {
 	}
 }
 
+thread_local Buffer::BindContext Buffer::s_bind;
+
 void Buffer::MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges, bool cold) {
 	if (!m_sparse) {
 		return;
@@ -367,6 +370,22 @@ void Buffer::MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> r
 	std::sort(missing.begin(), missing.end());
 	missing.erase(std::unique(missing.begin(), missing.end()), missing.end());
 	KYTY_PROFILER_FUNCTION();
+	const uint64_t missing_bytes = static_cast<uint64_t>(missing.size()) * m_chunk_size;
+	if (!cold && !s_bind.data && missing_bytes >= (64ull << 20u)) {
+		cold = true;
+	}
+	if (missing_bytes >= (256ull << 20u) && !s_bind.reported) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1) < 16) {
+			std::printf("Buffer: %s backs %llu MB of the sparse buffer at 0x%010llx at once in %s "
+			            "memory\n",
+			            s_bind.why != nullptr ? s_bind.why : "an unnamed path",
+			            static_cast<unsigned long long>(missing_bytes >> 20u),
+			            static_cast<unsigned long long>(m_cpu_address),
+			            cold && m_host_type_bits != 0 ? "system" : "video");
+			std::fflush(stdout);
+		}
+	}
 	// Newly bound memory holds garbage until it is zeroed, and submitted work may read these
 	// pages (as unmapped, expecting zero): let it finish first.
 	WaitSubmitted();

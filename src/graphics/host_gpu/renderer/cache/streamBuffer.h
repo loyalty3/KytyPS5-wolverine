@@ -62,6 +62,29 @@ public:
 	void MakeResident(uint64_t offset, uint64_t size, bool cold = false);
 	// The same for several ranges (offset, size) at once: one wait, one bind.
 	void MakeResidentRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges, bool cold = false);
+	// Why the binds made on this thread are made (MakeResident*), for the large-bind report and
+	// the memory chosen. data: the chunks get bytes the scene uses (uploads, merges, the BDA page
+	// table), so they stay in video memory. reported: the caller names large binds itself.
+	// A bind of 64 MB or more that is not data goes to system memory: in the second half of
+	// 2026-10-11 the geometry pool went from 1.2 GB to all 2.7 GB of video memory in one 689 ms
+	// bind that no named path reported, and the card ran out.
+	struct BindContext {
+		const char* why      = nullptr;
+		bool        data     = false;
+		bool        reported = false;
+	};
+	class BindScope {
+	public:
+		BindScope(const char* why, bool data, bool reported): m_saved(s_bind) {
+			s_bind = {why, data, reported};
+		}
+		~BindScope() { s_bind = m_saved; }
+		BindScope(const BindScope&)            = delete;
+		BindScope& operator=(const BindScope&) = delete;
+
+	private:
+		BindContext m_saved;
+	};
 	// Chunks in system memory (ChunkState ChunkHost) move to video memory, contents kept.
 	void PromoteChunks(std::span<const uint64_t> chunks);
 	static constexpr uint8_t ChunkUnbound = 0;
@@ -159,6 +182,7 @@ private:
 		uint64_t        size       = 0;
 		uint64_t        used       = 0;
 	};
+	static thread_local BindContext s_bind;
 	std::vector<Slab>             m_slabs;      // video memory
 	std::vector<Slab>             m_host_slabs; // system memory (cold chunks)
 	uint32_t                      m_host_type_bits = 0;

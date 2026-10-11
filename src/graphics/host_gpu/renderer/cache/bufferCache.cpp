@@ -155,7 +155,10 @@ void BufferCache::FilterSparseCopies(Buffer& buffer, std::vector<vk::BufferCopy>
 			done += length;
 		}
 	}
-	buffer.MakeResidentRanges(bind);
+	{
+		const Buffer::BindScope scope("a non-zero upload", true, false);
+		buffer.MakeResidentRanges(bind);
+	}
 	if (!promote.empty()) {
 		std::sort(promote.begin(), promote.end());
 		promote.erase(std::unique(promote.begin(), promote.end()), promote.end());
@@ -176,7 +179,11 @@ static void MakeResidentNamed(Buffer& buffer, uint64_t offset, uint64_t size, co
 		return;
 	}
 	const auto unbound = buffer.UnboundBytes(offset, size);
-	const bool cold    = cold_ok && unbound >= (64ull << 20u);
+	// A merge copies the bytes of the buffer it absorbs: those stay in video memory. Any other
+	// bind of 64 MB or more goes to system memory (Buffer::BindContext).
+	const bool data    = std::strcmp(why, "a buffer merge") == 0;
+	const bool cold    = !data && unbound >= (64ull << 20u);
+	(void)cold_ok; // every write binding now; kept for the call sites' record
 	if (const auto bytes = unbound; bytes >= (256ull << 20u)) {
 		static std::atomic<uint32_t> reported {0};
 		if (reported.fetch_add(1) < 16) {
@@ -188,6 +195,7 @@ static void MakeResidentNamed(Buffer& buffer, uint64_t offset, uint64_t size, co
 			std::fflush(stdout);
 		}
 	}
+	const Buffer::BindScope scope(why, data, true);
 	buffer.MakeResident(offset, size, cold);
 }
 
@@ -200,6 +208,7 @@ void BufferCache::MakeSparseBuffersResident() {
 		(void)address;
 		auto& buffer = m_slot_buffers[id];
 		if (buffer.IsSparse()) {
+			const Buffer::BindScope scope("a shader storing through pointers", false, true);
 			buffer.MakeResident(0, buffer.Size());
 		}
 	}
@@ -249,6 +258,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
+		const Buffer::BindScope scope("the BDA page table", true, false);
 		m_bda_pagetable_buffer->MakeResident(table_offset,
 		                                     addresses.size() * sizeof(vk::DeviceAddress));
 		WriteDataBuffer(*m_bda_pagetable_buffer, table_offset,
@@ -1281,7 +1291,22 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 	}
 	// Only GPU-written pieces of the window are looked at, and unwritten pages leave the set in
 	// runs: page-by-page set operations cost the GPU thread more than the downloads they saved.
-	auto*                                      words = reinterpret_cast<uint32_t*>(m_write_bitmap->Mapped().data());
+	// The bitmap lives in device memory the host reaches over the bus (uncached): each word was
+	// read once per page, 32 times over, ~400 us a refinement in the second half (2026-10-11).
+	// The window's words are copied out once and the cleared bits written back once per word.
+	auto* words = reinterpret_cast<uint32_t*>(m_write_bitmap->Mapped().data());
+	const auto limit_end  = std::min(end, WriteBitmapLimit);
+	const auto first_word = (begin >> WriteBitmapPageBits) >> 5u;
+	const auto word_end   = begin < limit_end
+	                            ? (((limit_end - 1) >> WriteBitmapPageBits) >> 5u) + 1
+	                            : first_word;
+	thread_local std::vector<uint32_t> local;
+	thread_local std::vector<uint32_t> cleared;
+	local.resize(static_cast<size_t>(word_end - first_word));
+	cleared.assign(local.size(), 0u);
+	if (!local.empty()) {
+		std::memcpy(local.data(), words + first_word, local.size() * sizeof(uint32_t));
+	}
 	std::vector<std::pair<uint64_t, uint64_t>> pieces;
 	m_gpu_modified_ranges.ForEachInRange(begin, end - begin, [&](uint64_t from, uint64_t to) {
 		pieces.emplace_back(from, to);
@@ -1294,9 +1319,9 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 			     page + WriteBitmapPage <= te && page + WriteBitmapPage <= WriteBitmapLimit;
 			     page += WriteBitmapPage) {
 				const auto index = page >> WriteBitmapPageBits;
-				auto&      word  = words[index >> 5u];
+				const auto slot  = static_cast<size_t>((index >> 5u) - first_word);
 				const auto bit   = uint32_t {1} << (index & 31u);
-				if ((word & bit) == 0) {
+				if ((local[slot] & bit) == 0) {
 					if (!unwritten.empty() && unwritten.back().second == page) {
 						unwritten.back().second = page + WriteBitmapPage;
 					} else {
@@ -1304,14 +1329,23 @@ bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, ui
 					}
 					dropped++;
 				} else {
-					word &= ~bit; // downloaded with the window now
+					local[slot] &= ~bit; // downloaded with the window now
+					cleared[slot] |= bit;
 					m_bitmap_written_pages++;
 				}
 			}
 		});
 	}
-	for (const auto [from, to]: unwritten) {
-		m_gpu_modified_ranges.Subtract(from, to - from);
+	for (size_t slot = 0; slot < cleared.size(); slot++) {
+		if (cleared[slot] != 0) {
+			words[first_word + slot] &= ~cleared[slot];
+		}
+	}
+	{
+		KYTY_PROFILER_BLOCK("RefineWithWriteBitmap::Subtract");
+		for (const auto [from, to]: unwritten) {
+			m_gpu_modified_ranges.Subtract(from, to - from);
+		}
 	}
 	m_bitmap_dropped_pages += dropped;
 	static uint64_t calls = 0;
