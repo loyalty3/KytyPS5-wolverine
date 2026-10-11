@@ -58,6 +58,16 @@ foreach(seed IN LISTS SEEDS)
 	list(APPEND absolute_seeds "${seed}")
 endforeach()
 
+# Files the recompiler reaches that cannot change a translation, left out of the hash so that
+# editing them does not throw the whole cache away: the profiler's zone macros, and the call
+# expander, whose output (the expanded code) is itself part of every entry's key
+# (pipelineCache.cpp BuildSourceKey).
+set(unhashed
+	"common/profiler.h"
+	"graphics/shader/recompiler/frontend/decode/ShaderFunctions.cpp"
+	"graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
+)
+
 list(SORT visited)
 set(manifest "${EXTRA}\n")
 set(switches)
@@ -77,9 +87,11 @@ foreach(current IN LISTS visited)
 			                    "directory to the shader cache ROOTS in CMakeLists.txt")
 		endif()
 	endif()
-	file(SHA256 "${current}" digest)
 	file(RELATIVE_PATH relative "${source_root}" "${current}")
-	string(APPEND manifest "${relative} ${digest}\n")
+	if(NOT relative IN_LIST unhashed)
+		file(SHA256 "${current}" digest)
+		string(APPEND manifest "${relative} ${digest}\n")
+	endif()
 	string(FIND "${current}" "${source_root}/graphics/shader/" in_shader)
 	if(in_shader EQUAL 0)
 		file(STRINGS "${current}" lines REGEX "\"KYTY_[A-Z0-9_]+\"")

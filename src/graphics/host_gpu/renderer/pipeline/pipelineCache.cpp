@@ -2175,13 +2175,24 @@ static bool WriteDriverCache(GraphicContext& m_graphics, vk::PipelineCache m_dri
 	return true;
 }
 
+// At most once a minute, and only after 10 s without a new pipeline: reading out the driver's
+// cache (hundreds of MB) holds it while pipelines are being created into it, and a write in the
+// middle of a compile burst left the GPU thread building pipelines at ~300 ms each (2026-10-11
+// log). The shader disk cache is not flushed here any more: its writer thread stores entries as
+// they come, and waiting for its queue stalled the GPU thread behind hundreds of MB of writes.
 void PipelineCache::SaveDuringSession() {
-	const auto now = std::chrono::steady_clock::now();
-	if (now - m_last_save_check < std::chrono::seconds(60)) {
+	const auto now   = std::chrono::steady_clock::now();
+	const auto built = g_pipelines_built.load(std::memory_order_relaxed);
+	if (built != m_seen_builds) {
+		m_seen_builds     = built;
+		m_last_build_seen = now;
+		return;
+	}
+	if (now - m_last_save_check < std::chrono::seconds(60) ||
+	    now - m_last_build_seen < std::chrono::seconds(10)) {
 		return;
 	}
 	m_last_save_check = now;
-	const auto built  = g_pipelines_built.load(std::memory_order_relaxed);
 	if (m_driver_cache == nullptr || built == m_saved_builds ||
 	    m_save_running.load(std::memory_order_acquire)) {
 		return;
@@ -2190,8 +2201,6 @@ void PipelineCache::SaveDuringSession() {
 	if (m_save_thread.joinable()) {
 		m_save_thread.join();
 	}
-	// The shader disk cache too, here on the GPU thread that owns it.
-	m_program_cache->FlushDisk();
 	m_save_running.store(true, std::memory_order_release);
 	m_save_thread = std::thread([this] {
 		(void)WriteDriverCache(m_graphics, m_driver_cache, m_driver_cache_path);

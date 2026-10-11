@@ -282,6 +282,10 @@ private:
 	std::atomic<bool>                                       m_save_running {false};
 	uint64_t                                                m_saved_builds   = 0;
 	std::chrono::steady_clock::time_point                   m_last_save_check {};
+	// The pipeline count last seen, and when it last changed: the cache is written only once
+	// building has been quiet for a while (SaveDuringSession).
+	uint64_t                                                m_seen_builds    = 0;
+	std::chrono::steady_clock::time_point                   m_last_build_seen {};
 
 	void InitializeDriverCache();
 	void SaveDuringSession();

@@ -654,21 +654,36 @@ struct ShaderFunctionExpander::Impl {
 		std::vector<uint32_t> code;
 		uint64_t              hash = 0; // XXH3 of code (ExpandShared)
 	};
-	// A result ExpandShared gave in this epoch (frame) for these exact inputs.
+	// A result ExpandShared gave in this epoch (frame). It is keyed by the user-data registers
+	// the call resolution consulted (and their values), not by all of the user data: dispatches
+	// of one shader differ in their buffer and constant pointers, which no call target depends
+	// on, so a memo keyed by every word missed nearly always (2026-10-11 log: 630 expansions a
+	// frame at 40-110 us, 10-38 % of the GPU thread in gameplay).
 	struct Memo {
-		uint64_t              epoch     = UINT64_MAX;
-		uint64_t              base      = 0;
-		uint32_t              wave_size = 0;
-		uint32_t              uses      = 0;
-		std::vector<uint32_t> user_data;
+		uint64_t              epoch           = UINT64_MAX;
+		uint64_t              base            = 0;
+		uint32_t              wave_size       = 0;
+		uint32_t              uses            = 0;
+		size_t                user_data_count = 0;
+		std::vector<uint32_t> dep_regs;
+		std::vector<uint32_t> dep_values;
 		const Expansion*      expansion = nullptr; // null: no calls (or a failure before one)
 		bool                  ok        = false;
 		std::string           reason;
+
+		[[nodiscard]] bool Matches(std::span<const uint32_t> user_data) const {
+			if (user_data_count != user_data.size()) return false;
+			for (size_t i = 0; i < dep_regs.size(); i++) {
+				if (dep_regs[i] >= user_data.size() || user_data[dep_regs[i]] != dep_values[i])
+					return false;
+			}
+			return true;
+		}
 	};
 	struct Shader {
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
-		std::array<Memo, 4>    memos {};
+		std::array<Memo, 8>    memos {};
 		uint32_t               next_memo = 0;
 	};
 	static constexpr size_t MaxExpansions = 8;
@@ -729,8 +744,7 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 	if (epoch != UINT64_MAX && shader.analysis.code.size() == code.size()) {
 		for (auto& memo: shader.memos) {
 			if (memo.epoch == epoch && memo.uses < 256 && memo.base == base &&
-			    memo.wave_size == wave_size && memo.user_data.size() == user_data.size() &&
-			    std::equal(user_data.begin(), user_data.end(), memo.user_data.begin())) {
+			    memo.wave_size == wave_size && memo.Matches(user_data)) {
 				memo.uses++;
 				if (memo.expansion != nullptr) {
 					expanded      = &memo.expansion->code;
@@ -741,16 +755,24 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 			}
 		}
 	}
+	// The user-data registers the call resolution consulted: the only user data the result
+	// depends on (ResolveCalls). Empty for a shader without calls.
+	std::set<uint32_t> dependencies;
 	auto remember = [&](const Impl::Expansion* expansion, bool ok) {
 		if (epoch == UINT64_MAX) {
 			return ok;
 		}
-		auto& memo     = shader.memos[shader.next_memo++ % shader.memos.size()];
-		memo.epoch     = epoch;
-		memo.base      = base;
-		memo.wave_size = wave_size;
-		memo.uses      = 0;
-		memo.user_data.assign(user_data.begin(), user_data.end());
+		auto& memo           = shader.memos[shader.next_memo++ % shader.memos.size()];
+		memo.epoch           = epoch;
+		memo.base            = base;
+		memo.wave_size       = wave_size;
+		memo.uses            = 0;
+		memo.user_data_count = user_data.size();
+		memo.dep_regs.assign(dependencies.begin(), dependencies.end());
+		memo.dep_values.clear();
+		for (const auto reg: memo.dep_regs) {
+			memo.dep_values.push_back(reg < user_data.size() ? user_data[reg] : 0u);
+		}
 		memo.expansion = expansion;
 		memo.ok        = ok;
 		memo.reason    = reason;
@@ -768,7 +790,6 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 		return remember(nullptr, false);
 	}
 	std::vector<CallSite> sites;
-	std::set<uint32_t>    dependencies;
 	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
 		return remember(nullptr, false);
 	}

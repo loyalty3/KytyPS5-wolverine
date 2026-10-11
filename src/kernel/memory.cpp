@@ -526,29 +526,19 @@ public:
 		}();
 		if (spans) {
 			const auto generation = m_coverage_generation.load(std::memory_order_acquire);
-			auto snapshot = std::atomic_load_explicit(&m_span_snapshot, std::memory_order_acquire);
-			if (snapshot == nullptr || snapshot->generation != generation) {
-				Common::LockGuard lock(m_mutex);
-				const auto current = m_coverage_generation.load(std::memory_order_relaxed);
-				snapshot = std::atomic_load_explicit(&m_span_snapshot, std::memory_order_relaxed);
-				if (snapshot == nullptr || snapshot->generation != current) {
-					KYTY_PROFILER_BLOCK("ClampRangeSize::RebuildSpans");
-					auto fresh        = std::make_shared<SpanSnapshot>();
-					fresh->generation = current;
-					RebuildSpansUnlocked(fresh->spans);
-					snapshot = std::move(fresh);
-					std::atomic_store_explicit(&m_span_snapshot, snapshot, std::memory_order_release);
-				}
+			// Each thread keeps the snapshot it last used. std::atomic_load of a shared_ptr takes
+			// a process-wide lock on MSVC and bounces the shared reference count between the
+			// GPU, draw-prep and translation threads on every call: 4,000 calls a frame at
+			// 2-5 us, 5-9 % of the GPU thread in gameplay (2026-10-11), for a search of a few
+			// hundred nanoseconds. The snapshot only changes with the coverage generation.
+			thread_local const VirtualRanges*             cached_owner = nullptr;
+			thread_local std::shared_ptr<const SpanSnapshot> cached_snapshot;
+			if (cached_owner != this || cached_snapshot == nullptr ||
+			    cached_snapshot->generation != generation) {
+				cached_snapshot = LoadSpanSnapshot(generation);
+				cached_owner    = this;
 			}
-			const auto& list = snapshot->spans;
-			auto        span = std::upper_bound(
-			    list.begin(), list.end(), virtual_addr,
-			    [](uint64_t value, const Span& candidate) { return value < candidate.start; });
-			if (span == list.begin()) {
-				return 0;
-			}
-			--span;
-			return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
+			return SearchSpans(cached_snapshot->spans, virtual_addr, size);
 		}
 
 		Common::LockGuard lock(m_mutex);
@@ -580,6 +570,44 @@ public:
 
 		return clamped_size;
 	}
+
+private:
+	struct Span;
+	struct SpanSnapshot;
+	// The published span snapshot of `generation` (or newer), rebuilt under the lock when stale.
+	std::shared_ptr<const SpanSnapshot> LoadSpanSnapshot(uint64_t generation) {
+		{
+			auto snapshot = std::atomic_load_explicit(&m_span_snapshot, std::memory_order_acquire);
+			if (snapshot != nullptr && snapshot->generation == generation) {
+				return snapshot;
+			}
+		}
+		Common::LockGuard lock(m_mutex);
+		const auto current  = m_coverage_generation.load(std::memory_order_relaxed);
+		auto       snapshot = std::atomic_load_explicit(&m_span_snapshot, std::memory_order_relaxed);
+		if (snapshot == nullptr || snapshot->generation != current) {
+			KYTY_PROFILER_BLOCK("ClampRangeSize::RebuildSpans");
+			auto fresh        = std::make_shared<SpanSnapshot>();
+			fresh->generation = current;
+			RebuildSpansUnlocked(fresh->spans);
+			snapshot = std::move(fresh);
+			std::atomic_store_explicit(&m_span_snapshot, snapshot, std::memory_order_release);
+		}
+		return snapshot;
+	}
+	static uint64_t SearchSpans(const std::vector<Span>& list, uint64_t virtual_addr,
+	                            uint64_t size) {
+		auto span = std::upper_bound(
+		    list.begin(), list.end(), virtual_addr,
+		    [](uint64_t value, const Span& candidate) { return value < candidate.start; });
+		if (span == list.begin()) {
+			return 0;
+		}
+		--span;
+		return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
+	}
+
+public:
 
 	uint64_t CountPageTableEntries(bool gpu) {
 		Common::LockGuard lock(m_mutex);
