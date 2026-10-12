@@ -3,6 +3,8 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include "common/profiler.h"
+
 #include <algorithm>
 #include <xxhash.h>
 #include <array>
@@ -236,7 +238,29 @@ struct ShaderAnalysis {
 	std::set<uint32_t>    labels;
 	bool                  has_calls = false;
 	bool                  has_setpc = false;
+
+	// The index of the first instruction writing each user-data register, per wave size
+	// (32, 64): ResolveCalls asks "is this register still the user data at instruction i" for
+	// every register it follows, and answered it by scanning every earlier instruction.
+	static constexpr uint32_t                     MaxUserRegs = 64;
+	mutable std::array<std::vector<uint32_t>, 2> first_write;
+
+	[[nodiscard]] uint32_t FirstWrite(uint32_t reg, uint32_t wave_size) const;
 };
+
+uint32_t ShaderAnalysis::FirstWrite(uint32_t reg, uint32_t wave_size) const {
+	auto& table = first_write[wave_size == 64u ? 1 : 0];
+	if (table.empty()) {
+		const auto count = static_cast<uint32_t>(program.instructions.size());
+		table.assign(MaxUserRegs, count);
+		for (uint32_t i = count; i-- > 0;) {
+			for (uint32_t r = 0; r < MaxUserRegs; r++) {
+				if (Writes(program.instructions[i], r, wave_size)) table[r] = i;
+			}
+		}
+	}
+	return reg < MaxUserRegs ? table[reg] : 0u;
+}
 
 void AnalyzeShader(std::span<const uint32_t> code, ShaderAnalysis& analysis) {
 	analysis.code.assign(code.begin(), code.end());
@@ -260,23 +284,48 @@ struct CallSite {
 	bool operator==(const CallSite&) const = default;
 };
 
+// The targets read from call tables, per epoch (frame). A shader with table calls re-read its
+// whole table (up to 16 MB) on every dispatch; the game cannot rewrite a call table under its
+// own frame's dispatches, as with the code itself (ShaderFunctionExpander::ExpandShared).
+struct CallTableCache {
+	struct Key {
+		uint64_t base       = 0;
+		uint64_t size       = 0;
+		uint64_t first_slot = 0;
+		uint64_t step       = 0;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const noexcept {
+			return std::hash<uint64_t> {}(key.base ^ (key.size * 0x9E3779B97F4A7C15ull) ^
+			                              (key.first_slot * 0xBF58476D1CE4E5B9ull) ^
+			                              (key.step << 48u));
+		}
+	};
+	struct Entry {
+		uint64_t              epoch  = UINT64_MAX;
+		bool                  mapped = false;
+		std::vector<uint64_t> targets; // non-zero slots, in slot order
+	};
+	std::unordered_map<Key, Entry, KeyHash> entries;
+};
+
 // Resolves each call's targets from the user data and the memory holding call tables. Which
 // registers it consults depends on the code alone; their values reach the result only through
 // the targets.
 bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
                   std::span<const uint32_t> user_data, const ShaderCodeReader& read,
                   uint32_t wave_size, std::vector<CallSite>& sites,
-                  std::set<uint32_t>& dependencies, std::string& reason) {
+                  std::set<uint32_t>& dependencies, std::string& reason,
+                  CallTableCache* tables = nullptr, uint64_t epoch = UINT64_MAX) {
 	const auto& program = analysis.program;
 	const auto& labels  = analysis.labels;
 	const auto resolve = [&](auto&& self, uint32_t reg, size_t before, size_t first, uint32_t depth,
 	                         bool load_memory = false) -> std::optional<uint32_t> {
 		if (reg >= 128 || depth > 32) return {};
-		const bool initial =
-		    reg < user_data.size() &&
-		    std::none_of(
-		        program.instructions.begin(), program.instructions.begin() + before,
-		        [&](const auto& inst) { return Writes(inst, reg, wave_size); });
+		// reg < MaxUserRegs always holds here (user data is at most 40 registers).
+		const bool initial = reg < user_data.size() && reg < ShaderAnalysis::MaxUserRegs &&
+		                     analysis.FirstWrite(reg, wave_size) >= before;
 		if (initial) {
 			dependencies.insert(reg);
 			return user_data[reg];
@@ -408,17 +457,37 @@ bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
 				reason = "shader call table needs unsupported bounds or addressing";
 				return false;
 			}
-			std::vector<uint32_t> table(size / 4u);
-			if (!read(descriptor.Base48(), table)) {
+			const uint64_t step       = uint64_t {1} << shift;
+			const uint64_t first_slot = (load.offset % step) + lo->second * 4u;
+			const auto read_targets = [&](CallTableCache::Entry& out) {
+				std::vector<uint32_t> table(size / 4u);
+				out.targets.clear();
+				out.mapped = read(descriptor.Base48(), table);
+				if (!out.mapped) return;
+				for (uint64_t offset = first_slot; offset + 8u <= size; offset += step) {
+					const uint64_t address =
+					    table[offset / 4u] | (uint64_t {table[offset / 4u + 1u]} << 32u);
+					// A runtime null target takes the explicit trap path.
+					if (address != 0) out.targets.push_back(address);
+				}
+			};
+			CallTableCache::Entry  uncached;
+			CallTableCache::Entry* table = &uncached;
+			if (tables != nullptr && epoch != UINT64_MAX) {
+				table = &tables->entries[{descriptor.Base48(), size, first_slot, step}];
+				if (table->epoch != epoch) {
+					KYTY_PROFILER_BLOCK("Expand::ReadCallTable");
+					read_targets(*table);
+					table->epoch = epoch;
+				}
+			} else {
+				read_targets(uncached);
+			}
+			if (!table->mapped) {
 				reason = "shader call table is not fully mapped";
 				return false;
 			}
-			const uint64_t step       = uint64_t {1} << shift;
-			const uint64_t first_slot = (load.offset % step) + lo->second * 4u;
-			for (uint64_t offset = first_slot; offset + 8u <= size; offset += step) {
-				const uint64_t address =
-				    table[offset / 4u] | (uint64_t {table[offset / 4u + 1u]} << 32u);
-				if (address == 0) continue; // A runtime null target takes the explicit trap path.
+			for (const auto address: table->targets) {
 				addresses.insert(address);
 				if (addresses.size() > MaxCallTargets) {
 					reason = "shader call table exceeds the bounded target count";
@@ -653,6 +722,8 @@ struct ShaderFunctionExpander::Impl {
 		std::string           reason;
 		std::vector<uint32_t> code;
 		uint64_t              hash = 0; // XXH3 of code (ExpandShared)
+		// The epoch in which its callee code was last compared with memory (StillReads).
+		uint64_t              verified_epoch = UINT64_MAX;
 	};
 	// A result ExpandShared gave in this epoch (frame). It is keyed by the user-data registers
 	// the call resolution consulted (and their values), not by all of the user data: dispatches
@@ -690,6 +761,7 @@ struct ShaderFunctionExpander::Impl {
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<uint32_t>                scratch;
+	CallTableCache                       tables;
 
 	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
 		for (const auto& [address, words]: expansion.reads) {
@@ -780,6 +852,7 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 	};
 	if (shader.analysis.code.size() != code.size() ||
 	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
+		KYTY_PROFILER_BLOCK("Expand::Analyze");
 		shader = {};
 		AnalyzeShader(code, shader.analysis);
 	}
@@ -790,13 +863,27 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 		return remember(nullptr, false);
 	}
 	std::vector<CallSite> sites;
-	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
+	bool                  resolved = false;
+	{
+		KYTY_PROFILER_BLOCK("Expand::ResolveCalls");
+		resolved = ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies,
+		                        reason, &m_impl->tables, epoch);
+	}
+	if (!resolved) {
 		return remember(nullptr, false);
 	}
-	for (const auto& expansion: shader.expansions) {
+	// Callee code compared with memory once per epoch, not on every dispatch.
+	const auto still_reads = [&](Impl::Expansion& expansion) {
+		if (epoch != UINT64_MAX && expansion.verified_epoch == epoch) return true;
+		KYTY_PROFILER_BLOCK("Expand::StillReads");
+		if (!m_impl->StillReads(expansion, read)) return false;
+		expansion.verified_epoch = epoch;
+		return true;
+	};
+	for (auto& expansion: shader.expansions) {
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
-		    m_impl->StillReads(expansion, read)) {
+		    still_reads(expansion)) {
 			expanded      = &expansion.code;
 			expanded_hash = expansion.hash;
 			reason        = expansion.reason;
@@ -814,8 +901,12 @@ bool ShaderFunctionExpander::ExpandShared(std::span<const uint32_t> code, uint64
 		    .emplace_back(address, std::vector<uint32_t>(words.begin(), words.end()));
 		return ok;
 	};
-	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
-	                              wave_size, expansion.code, expansion.reason);
+	{
+		KYTY_PROFILER_BLOCK("Expand::Build");
+		expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
+		                              wave_size, expansion.code, expansion.reason);
+	}
+	expansion.verified_epoch = epoch;
 	MergeReads(expansion.reads);
 	// Never 0 for code, so a zero hash keeps meaning "no expansion".
 	expansion.hash = expansion.code.empty()

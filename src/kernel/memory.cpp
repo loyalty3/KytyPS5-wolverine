@@ -533,6 +533,20 @@ public:
 			// hundred nanoseconds. The snapshot only changes with the coverage generation.
 			thread_local const VirtualRanges*             cached_owner = nullptr;
 			thread_local std::shared_ptr<const SpanSnapshot> cached_snapshot;
+			if (cached_owner == this && cached_snapshot != nullptr &&
+			    cached_snapshot->generation != generation &&
+			    generation - cached_snapshot->generation <= 128) {
+				// Coverage changed since this thread's snapshot, nearly always somewhere else
+				// (the game maps and unmaps streaming memory dozens of times a frame). The old
+				// answer stands when no change since touched this range; otherwise every
+				// thread queued on the lock behind the game thread's mapping calls, 10-25 us a
+				// call while streaming (2026-10-12).
+				const auto answer = SearchSpans(cached_snapshot->spans, virtual_addr, size);
+				if (CoverageUnchanged(cached_snapshot->generation, generation, virtual_addr,
+				                      virtual_addr + size, answer == size)) {
+					return answer;
+				}
+			}
 			if (cached_owner != this || cached_snapshot == nullptr ||
 			    cached_snapshot->generation != generation) {
 				cached_snapshot = LoadSpanSnapshot(generation);

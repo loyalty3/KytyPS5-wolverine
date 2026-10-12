@@ -5,6 +5,7 @@
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <cstdarg>
@@ -12,6 +13,16 @@
 #include <cstdlib>
 #include <iterator>
 #include <tracy/Tracy.hpp>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace Profiler {
 
@@ -87,7 +98,86 @@ void PlotCounters() {
 
 } // namespace
 
+namespace {
+
+// Scheduling for the emulator's own threads, by the name each gives itself at start.
+// The GPU thread is the frame's critical path, and the recording, submission and draw-prep
+// threads feed it; on a hybrid CPU (Core Ultra: 8 performance and 12 efficient cores) Windows may
+// run any of them on an efficient core, or let the six shader translators and four pipeline
+// compilers crowd them off the performance cores. Critical threads get a higher priority and
+// are marked high-QoS (opted out of EcoQoS, which steers threads to efficient cores); the
+// translators and compilers run below normal. KYTY_THREAD_PRIORITY=0 leaves all as they were.
+enum class ThreadRole : uint8_t { Normal, Critical, Background };
+
+[[maybe_unused]] ThreadRole RoleOf(const char* name) {
+	static constexpr const char* kCritical[]   = {"Thread_Gpu", "GpuRecord", "GpuQueueSubmit",
+	                                              "Thread_DrawPrep", "StagePrep"};
+	static constexpr const char* kBackground[] = {"ShaderTranslator", "PipelineCompiler"};
+	for (const char* candidate: kCritical) {
+		if (std::strcmp(name, candidate) == 0) return ThreadRole::Critical;
+	}
+	for (const char* candidate: kBackground) {
+		if (std::strcmp(name, candidate) == 0) return ThreadRole::Background;
+	}
+	return ThreadRole::Normal;
+}
+
+bool ThreadPriorityEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_THREAD_PRIORITY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+void ApplyThreadRole(const char* name) {
+	if (name == nullptr || !ThreadPriorityEnabled()) {
+		return;
+	}
+#if defined(_WIN32)
+	static const bool process_done = [] {
+#if defined(PROCESS_POWER_THROTTLING_CURRENT_VERSION)
+		// The whole process out of EcoQoS: Windows otherwise may throttle it when its window
+		// is not in front, and EcoQoS threads are scheduled on the efficient cores.
+		PROCESS_POWER_THROTTLING_STATE state {};
+		state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+		state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+		state.StateMask   = 0;
+		(void)SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state,
+		                            sizeof(state));
+#endif
+		return true;
+	}();
+	(void)process_done;
+	const auto role = RoleOf(name);
+	if (role == ThreadRole::Normal) {
+		return;
+	}
+	const auto thread = GetCurrentThread();
+	(void)SetThreadPriority(thread, role == ThreadRole::Critical ? THREAD_PRIORITY_HIGHEST
+	                                                             : THREAD_PRIORITY_BELOW_NORMAL);
+#if defined(THREAD_POWER_THROTTLING_CURRENT_VERSION)
+	if (role == ThreadRole::Critical) {
+		THREAD_POWER_THROTTLING_STATE state {};
+		state.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+		state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+		state.StateMask   = 0;
+		(void)SetThreadInformation(thread, ThreadPowerThrottling, &state, sizeof(state));
+	}
+#endif
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1) < 16) {
+		std::printf("Thread %s: %s priority\n", name,
+		            role == ThreadRole::Critical ? "high (performance cores preferred)"
+		                                         : "below normal");
+	}
+#endif
+}
+
+} // namespace
+
 void SetThreadName(const char* name) {
+	ApplyThreadRole(name);
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
 	}
@@ -249,7 +339,14 @@ void PerfZone::Finish() {
 	}
 	const char* name = PerfZoneLabel(m_location);
 	if (name != nullptr && std::strncmp(name, "MasterSemaphore::Wait", 21) == 0) {
-		// Charged to the nearest enclosing zone that is not itself a wait.
+		// Charged to the nearest enclosing zone that is not itself a wait, nor the download
+		// plumbing every readback goes through (which named only DownloadBufferCopies, not the
+		// work that needed the bytes); the plumbing is kept when nothing else encloses it.
+		const auto plumbing = [](const char* label) {
+			return label != nullptr &&
+			       (std::strstr(label, "Wait") != nullptr || std::strstr(label, "Download") != nullptr ||
+			        std::strstr(label, "ReadMemory") != nullptr);
+		};
 		auto* owner = m_parent;
 		while (owner != nullptr) {
 			const char* owner_name = PerfZoneLabel(owner->m_location);
@@ -257,6 +354,12 @@ void PerfZone::Finish() {
 				break;
 			}
 			owner = owner->m_parent;
+		}
+		for (auto* outer = owner; outer != nullptr; outer = outer->m_parent) {
+			if (!plumbing(PerfZoneLabel(outer->m_location))) {
+				owner = outer;
+				break;
+			}
 		}
 		if (owner != nullptr) {
 			if (auto* slot = FindSlot(owner->m_location); slot != nullptr) {

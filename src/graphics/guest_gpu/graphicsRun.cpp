@@ -437,6 +437,25 @@ void CommandProcessor::CompleteDraw() {
 	GetScheduler().CompleteDraw();
 }
 
+// Dispatches count toward the periodic submission as draws do. Only draws did: in gameplay
+// 400-600 dispatches a frame against ~300 draws, the compute passes sat recorded and unsubmitted
+// until something waited on the GPU, so the card idled while the GPU thread recorded and the GPU
+// thread then idled while the card caught up (Run A, 2026-10-11: 38 ms of card work and ~24 ms of
+// recording a frame, run one after the other). KYTY_DISPATCH_FLUSH=0 counts draws only.
+static bool DispatchFlush() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DISPATCH_FLUSH");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+void CommandProcessor::CompleteDispatch() {
+	if (DispatchFlush()) {
+		GetScheduler().CompleteDraw();
+	}
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -1370,6 +1389,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
 	}
+	CompleteDispatch();
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
@@ -1385,6 +1405,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	CompleteDispatch();
 }
 
 uint32_t CommandProcessor::NumInstances() {
