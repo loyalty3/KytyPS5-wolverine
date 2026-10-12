@@ -1916,11 +1916,23 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
+// Adjacent maybe-dirty tracker regions are joined into one run first: region by region, a buffer
+// spanning many regions (the 2.7 GB geometry pool spans hundreds) was synchronized once per
+// region, ~55,000 synchronizations a frame and 10-12 % of the GPU thread in gameplay
+// (2026-10-12). Synchronizing a wider range uploads nothing more: only CPU-dirty pages upload.
 void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
 	m_memory_tracker.ForEachMaybeCpuDirtyRegion(
-	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
-		    SynchronizeBuffersInRange(address, bytes);
+	    vaddr, size, [&runs](uint64_t address, uint64_t bytes) {
+		    if (!runs.empty() && runs.back().second == address) {
+			    runs.back().second = address + bytes;
+		    } else {
+			    runs.emplace_back(address, address + bytes);
+		    }
 	    });
+	for (const auto& [begin, end]: runs) {
+		SynchronizeBuffersInRange(begin, end - begin);
+	}
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

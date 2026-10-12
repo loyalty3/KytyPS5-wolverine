@@ -757,7 +757,9 @@ struct ShaderFunctionExpander::Impl {
 		std::array<Memo, 8>    memos {};
 		uint32_t               next_memo = 0;
 	};
-	static constexpr size_t MaxExpansions = 8;
+	// A shader dispatched with more call-target sets than this rebuilds an expansion (20-35 ms)
+	// whenever one comes back (Expand::Build, 5.7 % of a gameplay window, 2026-10-12).
+	static constexpr size_t MaxExpansions = 32;
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<uint32_t>                scratch;

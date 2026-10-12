@@ -2181,6 +2181,17 @@ static bool WriteDriverCache(GraphicContext& m_graphics, vk::PipelineCache m_dri
 // log). The shader disk cache is not flushed here any more: its writer thread stores entries as
 // they come, and waiting for its queue stalled the GPU thread behind hundreds of MB of writes.
 void PipelineCache::SaveDuringSession() {
+	// Off unless KYTY_PIPELINE_SAVE_DURING_SESSION=1. Even after a quiet spell, the next area's
+	// pipelines landed while the driver cache was being read out: 3 pipelines took 3.9 s on the
+	// GPU thread with the save running (2026-10-12, as on 10-11). The driver keeps its own shader
+	// cache, so pipelines a crash loses from ours still build quickly next session.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_SAVE_DURING_SESSION");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) {
+		return;
+	}
 	const auto now   = std::chrono::steady_clock::now();
 	const auto built = g_pipelines_built.load(std::memory_order_relaxed);
 	if (built != m_seen_builds) {
